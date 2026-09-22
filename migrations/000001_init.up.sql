@@ -38,6 +38,7 @@ CREATE TABLE wager_transactions (
 CREATE UNIQUE INDEX wager_provider_external_unique ON wager_transactions(provider_id, external_transaction_id) WHERE provider_id IS NOT NULL;
 CREATE UNIQUE INDEX wager_provider_key_unique ON wager_transactions(provider_id, idempotency_key) WHERE provider_id IS NOT NULL;
 CREATE UNIQUE INDEX wager_opening_unique ON wager_transactions(wallet_id) WHERE kind = 'OPENING';
+CREATE UNIQUE INDEX wager_single_reversal_unique ON wager_transactions(reference_transaction_id) WHERE status = 'PROCESSED' AND kind IN ('REFUND','ROLLBACK');
 
 CREATE TABLE wallet_ledger_entries (
     id uuid PRIMARY KEY,
@@ -80,4 +81,3 @@ CREATE TABLE outbox_events (
     claimed_until timestamptz
 );
 CREATE INDEX outbox_ready_idx ON outbox_events(next_attempt_at) WHERE published_at IS NULL;
-
