@@ -1,0 +1,23 @@
+{
+  "realm": "apostas",
+  "enabled": true,
+  "clients": [
+    {
+      "clientId": "provider-a",
+      "enabled": true,
+      "publicClient": false,
+      "serviceAccountsEnabled": true,
+      "secret": "provider-a-local-only",
+      "directAccessGrantsEnabled": false
+    },
+    {
+      "clientId": "wallet-service",
+      "enabled": true,
+      "publicClient": false,
+      "serviceAccountsEnabled": true,
+      "secret": "wallet-service-local-only",
+      "directAccessGrantsEnabled": false
+    }
+  ]
+}
+
