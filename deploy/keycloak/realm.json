@@ -8,7 +8,10 @@
       "publicClient": false,
       "serviceAccountsEnabled": true,
       "secret": "provider-a-local-only",
-      "directAccessGrantsEnabled": false
+      "directAccessGrantsEnabled": false,
+      "protocolMappers": [
+        {"name":"api-audience","protocol":"openid-connect","protocolMapper":"oidc-audience-mapper","config":{"included.client.audience":"apostas-api","access.token.claim":"true"}}
+      ]
     },
     {
       "clientId": "wallet-service",
@@ -16,8 +19,10 @@
       "publicClient": false,
       "serviceAccountsEnabled": true,
       "secret": "wallet-service-local-only",
-      "directAccessGrantsEnabled": false
+      "directAccessGrantsEnabled": false,
+      "protocolMappers": [
+        {"name":"api-audience","protocol":"openid-connect","protocolMapper":"oidc-audience-mapper","config":{"included.client.audience":"apostas-api","access.token.claim":"true"}}
+      ]
     }
   ]
 }
-
