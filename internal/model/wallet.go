@@ -2,6 +2,7 @@ package model
 
 import (
 	"errors"
+	"math"
 	"time"
 
 	"github.com/google/uuid"
@@ -20,17 +21,19 @@ type Wallet struct {
 }
 
 func NewWallet(id, playerID uuid.UUID, initial Money, now time.Time) (Wallet, error) {
-	if id == uuid.Nil || playerID == uuid.Nil || !initial.Valid() || initial.Minor() < 0 || now.IsZero() {
+	wallet := Wallet{id: id, playerID: playerID, balance: initial, version: 1, createdAt: now, updatedAt: now}
+	if !wallet.Valid() {
 		return Wallet{}, ErrInvalidWallet
 	}
-	return Wallet{id: id, playerID: playerID, balance: initial, version: 1, createdAt: now, updatedAt: now}, nil
+	return wallet, nil
 }
 
 func RehydrateWallet(id, playerID uuid.UUID, balance Money, version int64, created, updated time.Time) (Wallet, error) {
-	if id == uuid.Nil || playerID == uuid.Nil || !balance.Valid() || balance.Minor() < 0 || version < 1 || created.IsZero() || updated.IsZero() {
+	wallet := Wallet{id: id, playerID: playerID, balance: balance, version: version, createdAt: created, updatedAt: updated}
+	if !wallet.Valid() {
 		return Wallet{}, ErrInvalidWallet
 	}
-	return Wallet{id: id, playerID: playerID, balance: balance, version: version, createdAt: created, updatedAt: updated}, nil
+	return wallet, nil
 }
 
 func (w Wallet) ID() uuid.UUID        { return w.id }
@@ -39,10 +42,19 @@ func (w Wallet) Balance() Money       { return w.balance }
 func (w Wallet) Version() int64       { return w.version }
 func (w Wallet) CreatedAt() time.Time { return w.createdAt }
 func (w Wallet) UpdatedAt() time.Time { return w.updatedAt }
+func (w Wallet) Valid() bool {
+	return w.id != uuid.Nil && w.playerID != uuid.Nil && w.balance.Valid() && w.balance.Minor() >= 0 && w.version >= 1 && !w.createdAt.IsZero() && !w.updatedAt.IsZero() && !w.updatedAt.Before(w.createdAt)
+}
 
 func (w *Wallet) Credit(amount Money, now time.Time) (Money, error) {
+	if !w.Valid() || now.Before(w.updatedAt) {
+		return Money{}, ErrInvalidWallet
+	}
 	if !amount.IsPositive() || now.IsZero() {
 		return Money{}, ErrInvalidMoney
+	}
+	if w.version == math.MaxInt64 {
+		return Money{}, ErrOverflow
 	}
 	if w.balance.Currency() != amount.Currency() {
 		return Money{}, ErrCurrencyMismatch
@@ -57,8 +69,14 @@ func (w *Wallet) Credit(amount Money, now time.Time) (Money, error) {
 }
 
 func (w *Wallet) Debit(amount Money, now time.Time) (Money, error) {
+	if !w.Valid() || now.Before(w.updatedAt) {
+		return Money{}, ErrInvalidWallet
+	}
 	if !amount.IsPositive() || now.IsZero() {
 		return Money{}, ErrInvalidMoney
+	}
+	if w.version == math.MaxInt64 {
+		return Money{}, ErrOverflow
 	}
 	if w.balance.Currency() != amount.Currency() {
 		return Money{}, ErrCurrencyMismatch

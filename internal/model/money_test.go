@@ -20,15 +20,17 @@ func TestMoney(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if a.Amount() != "25.50" {
-		t.Fatalf("amount=%s", a.Amount())
+	amount, err := a.Amount()
+	if err != nil || amount != "25.50" {
+		t.Fatalf("amount=%s err=%v", amount, err)
 	}
 	b, err := ParseMoney("0.01", "BRL")
 	if err != nil {
 		t.Fatal(err)
 	}
 	c, err := a.Sub(b)
-	if err != nil || c.Amount() != "25.49" {
+	amount, amountErr := c.Amount()
+	if err != nil || amountErr != nil || amount != "25.49" {
 		t.Fatalf("subtract: %v %v", c, err)
 	}
 	encoded, err := json.Marshal(c)
@@ -59,14 +61,16 @@ func TestWalletInvariants(t *testing.T) {
 	if _, err := w.Debit(large, time.Now()); !errors.Is(err, ErrInsufficientFunds) {
 		t.Fatalf("debit err=%v", err)
 	}
-	if w.Version() != 1 || w.Balance().Amount() != "100.00" {
+	amount, _ := w.Balance().Amount()
+	if w.Version() != 1 || amount != "100.00" {
 		t.Fatal("wallet changed after rejected debit")
 	}
 	small, _ := ParseMoney("80.00", "BRL")
 	if _, err := w.Debit(small, time.Now()); err != nil {
 		t.Fatal(err)
 	}
-	if w.Version() != 2 || w.Balance().Amount() != "20.00" {
+	amount, _ = w.Balance().Amount()
+	if w.Version() != 2 || amount != "20.00" {
 		t.Fatal("wrong wallet state")
 	}
 }
@@ -92,5 +96,25 @@ func TestTransactionStateAndKinds(t *testing.T) {
 	}
 	if err := s.Transition(Rejected); !errors.Is(err, ErrTerminalTransaction) {
 		t.Fatalf("terminal err=%v", err)
+	}
+	var uninitialized TransactionState
+	if err := uninitialized.Transition(Processed); !errors.Is(err, ErrInvalidTransaction) {
+		t.Fatalf("uninitialized transition err=%v", err)
+	}
+}
+
+func TestDomainValuesRejectInvalidState(t *testing.T) {
+	var money Money
+	if _, err := money.Amount(); !errors.Is(err, ErrInvalidMoney) {
+		t.Fatalf("invalid money formatting err=%v", err)
+	}
+	balance, _ := ParseMoney("1.00", "BRL")
+	created := time.Now().UTC()
+	if _, err := RehydrateWallet(uuid.New(), uuid.New(), balance, 1, created, created.Add(-time.Second)); !errors.Is(err, ErrInvalidWallet) {
+		t.Fatalf("invalid wallet chronology err=%v", err)
+	}
+	var wallet Wallet
+	if _, err := wallet.Credit(balance, time.Now().UTC()); !errors.Is(err, ErrInvalidWallet) {
+		t.Fatalf("uninitialized wallet transition err=%v", err)
 	}
 }

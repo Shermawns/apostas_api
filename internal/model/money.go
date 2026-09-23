@@ -106,22 +106,28 @@ func (m Money) Compare(n Money) (int, error) {
 	return 0, nil
 }
 
-func (m Money) Amount() string {
-	if m.minor < 0 {
-		// Avoid negating MinInt64.
-		return fmt.Sprintf("-%d.%02d", -(m.minor / 100), -(m.minor % 100))
+func (m Money) Amount() (string, error) {
+	if !m.Valid() {
+		return "", ErrInvalidMoney
 	}
-	return fmt.Sprintf("%d.%02d", m.minor/100, m.minor%100)
+	if m.minor < 0 {
+		return fmt.Sprintf("-%d.%02d", -(m.minor / 100), -(m.minor % 100)), nil
+	}
+	return fmt.Sprintf("%d.%02d", m.minor/100, m.minor%100), nil
 }
 
 func (m Money) MarshalJSON() ([]byte, error) {
 	if !m.Valid() {
 		return nil, ErrInvalidMoney
 	}
+	amount, err := m.Amount()
+	if err != nil {
+		return nil, err
+	}
 	return json.Marshal(struct {
 		Amount   string `json:"amount"`
 		Currency string `json:"currency"`
-	}{m.Amount(), m.currency})
+	}{amount, m.currency})
 }
 
 func (m *Money) UnmarshalJSON(data []byte) error {

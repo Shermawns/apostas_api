@@ -59,7 +59,18 @@ func RehydrateTransactionState(status Status) (TransactionState, error) {
 	return TransactionState{}, ErrInvalidTransaction
 }
 func (s TransactionState) Status() Status { return s.status }
+func (s TransactionState) Valid() bool {
+	switch s.status {
+	case Pending, PendingReference, Processed, Rejected, Failed:
+		return true
+	default:
+		return false
+	}
+}
 func (s *TransactionState) Transition(next Status) error {
+	if !s.Valid() {
+		return ErrInvalidTransaction
+	}
 	if s.status == Processed || s.status == Rejected || s.status == Failed {
 		return ErrTerminalTransaction
 	}
