@@ -18,19 +18,13 @@ import (
 
 const consumerName = "wager-transaction-consumer"
 
-type inboxStore interface {
-	StartInbox(context.Context, string, string, string) (bool, error)
-	CompleteInbox(context.Context, string, string) error
-}
-
 type InputConsumer struct {
 	queue *queue.Client
-	inbox inboxStore
 	wager *usecases.Wager
 }
 
-func NewInputConsumer(queue *queue.Client, store *postgres.Store, wager *usecases.Wager) *InputConsumer {
-	return &InputConsumer{queue: queue, inbox: store, wager: wager}
+func NewInputConsumer(queue *queue.Client, wager *usecases.Wager) *InputConsumer {
+	return &InputConsumer{queue: queue, wager: wager}
 }
 
 func (w *InputConsumer) Name() string { return consumerName }
@@ -81,16 +75,12 @@ func (w *InputConsumer) handle(ctx context.Context, message queue.Message) error
 	}
 	request.Operation.IdempotencyKey = request.IdempotencyKey
 	sum := sha256.Sum256([]byte(message.Body))
-	shouldProcess, err := w.inbox.StartInbox(ctx, consumerName, envelope.MessageID, hex.EncodeToString(sum[:]))
-	if err != nil {
-		return err
-	}
-	if shouldProcess {
-		if _, err := w.wager.Process(ctx, request.Operation); err != nil {
-			return err
-		}
-	}
-	return w.inbox.CompleteInbox(ctx, consumerName, envelope.MessageID)
+	_, err := w.wager.ProcessInbox(ctx, usecases.InboxMessage{
+		ConsumerName: consumerName,
+		MessageID:    envelope.MessageID,
+		PayloadHash:  hex.EncodeToString(sum[:]),
+	}, request.Operation)
+	return err
 }
 
 type OutboxPublisher struct {

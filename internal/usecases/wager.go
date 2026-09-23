@@ -59,6 +59,13 @@ type Result struct {
 
 type WagerStore interface {
 	Execute(context.Context, Operation, string, func(*model.Wallet, *Reference, time.Time) Decision) (Result, error)
+	ExecuteInbox(context.Context, InboxMessage, Operation, string, func(*model.Wallet, *Reference, time.Time) Decision) (Result, error)
+}
+
+type InboxMessage struct {
+	ConsumerName string
+	MessageID    string
+	PayloadHash  string
 }
 
 type Wager struct{ store WagerStore }
@@ -66,6 +73,14 @@ type Wager struct{ store WagerStore }
 func NewWager(store WagerStore) *Wager { return &Wager{store: store} }
 
 func (u *Wager) Process(ctx context.Context, op Operation) (Result, error) {
+	return u.process(ctx, op, nil)
+}
+
+func (u *Wager) ProcessInbox(ctx context.Context, inbox InboxMessage, op Operation) (Result, error) {
+	return u.process(ctx, op, &inbox)
+}
+
+func (u *Wager) process(ctx context.Context, op Operation, inbox *InboxMessage) (Result, error) {
 	if strings.TrimSpace(op.ProviderID) == "" || strings.TrimSpace(op.ExternalTransactionID) == "" || strings.TrimSpace(op.IdempotencyKey) == "" || strings.TrimSpace(op.RoundID) == "" || strings.TrimSpace(op.GameID) == "" || op.PlayerID == uuid.Nil || op.WalletID == uuid.Nil {
 		return Result{}, ErrInvalidInput
 	}
@@ -78,9 +93,13 @@ func (u *Wager) Process(ctx context.Context, op Operation) (Result, error) {
 		return Result{}, err
 	}
 	sum := sha256.Sum256(canonical)
-	return u.store.Execute(ctx, op, hex.EncodeToString(sum[:]), func(wallet *model.Wallet, ref *Reference, now time.Time) Decision {
+	decision := func(wallet *model.Wallet, ref *Reference, now time.Time) Decision {
 		return Decide(op, wallet, ref, now)
-	})
+	}
+	if inbox != nil {
+		return u.store.ExecuteInbox(ctx, *inbox, op, hex.EncodeToString(sum[:]), decision)
+	}
+	return u.store.Execute(ctx, op, hex.EncodeToString(sum[:]), decision)
 }
 
 func Decide(op Operation, wallet *model.Wallet, ref *Reference, now time.Time) Decision {

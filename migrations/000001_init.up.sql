@@ -48,8 +48,10 @@ CREATE TABLE wallet_ledger_entries (
     amount_minor bigint NOT NULL CHECK (amount_minor > 0),
     balance_before_minor bigint NOT NULL CHECK (balance_before_minor >= 0),
     balance_after_minor bigint NOT NULL CHECK (balance_after_minor >= 0),
+	wallet_version bigint NOT NULL CHECK (wallet_version >= 1),
     created_at timestamptz NOT NULL DEFAULT now(),
     UNIQUE (wallet_id, transaction_id),
+	UNIQUE (wallet_id, wallet_version),
     CHECK ((direction = 'CREDIT' AND balance_after_minor::numeric = balance_before_minor::numeric + amount_minor::numeric)
         OR (direction = 'DEBIT' AND balance_after_minor::numeric = balance_before_minor::numeric - amount_minor::numeric))
 );
@@ -59,6 +61,44 @@ BEGIN
 END;
 $$;
 CREATE TRIGGER wallet_ledger_immutable BEFORE UPDATE OR DELETE ON wallet_ledger_entries FOR EACH ROW EXECUTE FUNCTION prevent_ledger_change();
+
+CREATE FUNCTION enforce_wallet_ledger_integrity() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    IF TG_TABLE_NAME = 'wallets' THEN
+        IF TG_OP = 'UPDATE' AND NEW.balance_minor = OLD.balance_minor AND NEW.version = OLD.version THEN
+            RETURN NULL;
+        END IF;
+        IF TG_OP = 'UPDATE' AND (NEW.balance_minor = OLD.balance_minor OR NEW.version <> OLD.version + 1) THEN
+            RAISE EXCEPTION 'wallet balance changes require exactly one new wallet version';
+        END IF;
+        IF (TG_OP = 'UPDATE' OR NEW.balance_minor <> 0) AND NOT EXISTS (
+            SELECT 1 FROM wallet_ledger_entries
+            WHERE wallet_id = NEW.id
+              AND wallet_version = NEW.version
+              AND balance_after_minor = NEW.balance_minor
+        ) THEN
+            RAISE EXCEPTION 'wallet balance requires a matching ledger entry';
+        END IF;
+        RETURN NULL;
+    END IF;
+
+    IF NOT EXISTS (
+        SELECT 1 FROM wallets
+        WHERE id = NEW.wallet_id
+          AND version = NEW.wallet_version
+          AND balance_minor = NEW.balance_after_minor
+    ) THEN
+        RAISE EXCEPTION 'ledger entry must match the wallet balance and version';
+    END IF;
+    RETURN NULL;
+END;
+$$;
+CREATE CONSTRAINT TRIGGER wallets_require_ledger
+AFTER INSERT OR UPDATE ON wallets DEFERRABLE INITIALLY DEFERRED
+FOR EACH ROW EXECUTE FUNCTION enforce_wallet_ledger_integrity();
+CREATE CONSTRAINT TRIGGER ledger_requires_wallet
+AFTER INSERT ON wallet_ledger_entries DEFERRABLE INITIALLY DEFERRED
+FOR EACH ROW EXECUTE FUNCTION enforce_wallet_ledger_integrity();
 
 CREATE TABLE inbox_messages (
     consumer_name text NOT NULL,

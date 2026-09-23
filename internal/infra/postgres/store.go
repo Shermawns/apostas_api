@@ -26,34 +26,38 @@ type OutboxEvent struct {
 
 func NewStore(pool *pgxpool.Pool) *Store { return &Store{Pool: pool} }
 
-func (s *Store) StartInbox(ctx context.Context, consumerName, messageID, payloadHash string) (bool, error) {
+func (s *Store) ExecuteInbox(ctx context.Context, inbox usecases.InboxMessage, op usecases.Operation, hash string, decide func(*model.Wallet, *usecases.Reference, time.Time) usecases.Decision) (usecases.Result, error) {
 	tx, err := s.Pool.Begin(ctx)
 	if err != nil {
-		return false, err
+		return usecases.Result{}, err
 	}
 	defer tx.Rollback(ctx)
 	var storedHash string
 	var completedAt *time.Time
-	err = tx.QueryRow(ctx, `SELECT payload_hash,completed_at FROM inbox_messages WHERE consumer_name=$1 AND message_id=$2 FOR UPDATE`, consumerName, messageID).Scan(&storedHash, &completedAt)
+	err = tx.QueryRow(ctx, `SELECT payload_hash,completed_at FROM inbox_messages WHERE consumer_name=$1 AND message_id=$2 FOR UPDATE`, inbox.ConsumerName, inbox.MessageID).Scan(&storedHash, &completedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
-		_, err = tx.Exec(ctx, `INSERT INTO inbox_messages(consumer_name,message_id,payload_hash) VALUES($1,$2,$3)`, consumerName, messageID, payloadHash)
+		_, err = tx.Exec(ctx, `INSERT INTO inbox_messages(consumer_name,message_id,payload_hash) VALUES($1,$2,$3)`, inbox.ConsumerName, inbox.MessageID, inbox.PayloadHash)
 		if err != nil {
-			return false, err
+			return usecases.Result{}, err
 		}
-		return true, tx.Commit(ctx)
+	} else if err != nil {
+		return usecases.Result{}, err
+	} else if storedHash != inbox.PayloadHash {
+		return usecases.Result{}, usecases.ErrConflict
+	} else if completedAt != nil {
+		return usecases.Result{}, tx.Commit(ctx)
 	}
+	result, err := s.executeTx(ctx, tx, op, hash, decide)
 	if err != nil {
-		return false, err
+		return usecases.Result{}, err
 	}
-	if storedHash != payloadHash {
-		return false, usecases.ErrConflict
+	if _, err := tx.Exec(ctx, `UPDATE inbox_messages SET completed_at=now() WHERE consumer_name=$1 AND message_id=$2`, inbox.ConsumerName, inbox.MessageID); err != nil {
+		return usecases.Result{}, err
 	}
-	return completedAt == nil, tx.Commit(ctx)
-}
-
-func (s *Store) CompleteInbox(ctx context.Context, consumerName, messageID string) error {
-	_, err := s.Pool.Exec(ctx, `UPDATE inbox_messages SET completed_at=now() WHERE consumer_name=$1 AND message_id=$2`, consumerName, messageID)
-	return err
+	if err := tx.Commit(ctx); err != nil {
+		return usecases.Result{}, err
+	}
+	return result, nil
 }
 
 func (s *Store) ClaimOutbox(ctx context.Context, limit int) ([]OutboxEvent, error) {
@@ -196,7 +200,7 @@ func (s *Store) ResolvePendingReference(ctx context.Context) (bool, error) {
 		if err != nil {
 			return false, err
 		}
-		_, err = tx.Exec(ctx, `INSERT INTO wallet_ledger_entries(id,wallet_id,transaction_id,direction,amount_minor,balance_before_minor,balance_after_minor) VALUES($1,$2,$3,$4,$5,$6,$7)`, uuid.New(), op.WalletID, transactionID, decision.Direction, op.Money.Minor(), decision.Before.Minor(), wallet.Balance().Minor())
+		_, err = tx.Exec(ctx, `INSERT INTO wallet_ledger_entries(id,wallet_id,transaction_id,direction,amount_minor,balance_before_minor,balance_after_minor,wallet_version) VALUES($1,$2,$3,$4,$5,$6,$7,$8)`, uuid.New(), op.WalletID, transactionID, decision.Direction, op.Money.Minor(), decision.Before.Minor(), wallet.Balance().Minor(), wallet.Version())
 		if err != nil {
 			return false, err
 		}
@@ -237,7 +241,7 @@ func (s *Store) CreateWallet(ctx context.Context, wallet model.Wallet) error {
 		if err != nil {
 			return err
 		}
-		_, err = tx.Exec(ctx, `INSERT INTO wallet_ledger_entries(id,wallet_id,transaction_id,direction,amount_minor,balance_before_minor,balance_after_minor) VALUES($1,$2,$3,'CREDIT',$4,0,$4)`, uuid.New(), wallet.ID(), transactionID, wallet.Balance().Minor())
+		_, err = tx.Exec(ctx, `INSERT INTO wallet_ledger_entries(id,wallet_id,transaction_id,direction,amount_minor,balance_before_minor,balance_after_minor,wallet_version) VALUES($1,$2,$3,'CREDIT',$4,0,$4,1)`, uuid.New(), wallet.ID(), transactionID, wallet.Balance().Minor())
 		if err != nil {
 			return err
 		}
@@ -423,7 +427,19 @@ func (s *Store) Execute(ctx context.Context, op usecases.Operation, hash string,
 		return usecases.Result{}, err
 	}
 	defer tx.Rollback(ctx)
+	result, err := s.executeTx(ctx, tx, op, hash, decide)
+	if err != nil {
+		return usecases.Result{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return usecases.Result{}, err
+	}
+	return result, nil
+}
+
+func (s *Store) executeTx(ctx context.Context, tx pgx.Tx, op usecases.Operation, hash string, decide func(*model.Wallet, *usecases.Reference, time.Time) usecases.Decision) (usecases.Result, error) {
 	// The wallet row serializes writers across all API and worker processes.
+	var err error
 	var player uuid.UUID
 	var currency string
 	var minor, version int64
@@ -458,7 +474,7 @@ func (s *Store) Execute(ctx context.Context, op usecases.Operation, hash string,
 		if existingFailure != nil {
 			result.FailureCode = *existingFailure
 		}
-		return result, tx.Commit(ctx)
+		return result, nil
 	}
 	if !errors.Is(err, pgx.ErrNoRows) {
 		return usecases.Result{}, err
@@ -504,7 +520,7 @@ func (s *Store) Execute(ctx context.Context, op usecases.Operation, hash string,
 		if err != nil {
 			return usecases.Result{}, err
 		}
-		_, err = tx.Exec(ctx, `INSERT INTO wallet_ledger_entries(id,wallet_id,transaction_id,direction,amount_minor,balance_before_minor,balance_after_minor) VALUES($1,$2,$3,$4,$5,$6,$7)`, uuid.New(), op.WalletID, transactionID, d.Direction, op.Money.Minor(), d.Before.Minor(), wallet.Balance().Minor())
+		_, err = tx.Exec(ctx, `INSERT INTO wallet_ledger_entries(id,wallet_id,transaction_id,direction,amount_minor,balance_before_minor,balance_after_minor,wallet_version) VALUES($1,$2,$3,$4,$5,$6,$7,$8)`, uuid.New(), op.WalletID, transactionID, d.Direction, op.Money.Minor(), d.Before.Minor(), wallet.Balance().Minor(), wallet.Version())
 		if err != nil {
 			return usecases.Result{}, err
 		}
@@ -520,9 +536,6 @@ func (s *Store) Execute(ctx context.Context, op usecases.Operation, hash string,
 		event = "WagerTransactionPendingReference"
 	}
 	if err := addEvent(ctx, tx, op.WalletID, event, map[string]any{"transactionId": transactionID, "providerId": op.ProviderID, "kind": op.Kind, "status": d.Status, "failureCode": d.FailureCode}); err != nil {
-		return usecases.Result{}, err
-	}
-	if err := tx.Commit(ctx); err != nil {
 		return usecases.Result{}, err
 	}
 	return usecases.Result{TransactionID: transactionID, Status: d.Status, Balance: wallet.Balance(), FailureCode: d.FailureCode}, nil
