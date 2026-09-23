@@ -13,6 +13,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"apostas_api/internal/infra/oidc"
+	"apostas_api/internal/infra/queue"
 	"apostas_api/internal/model"
 	"apostas_api/internal/usecases"
 )
@@ -22,10 +23,11 @@ type Handler struct {
 	wager   *usecases.Wager
 	reader  *usecases.Reader
 	pool    *pgxpool.Pool
+	queue   *queue.Client
 }
 
-func NewHandler(wallets *usecases.Wallets, wager *usecases.Wager, reader *usecases.Reader, pool *pgxpool.Pool) *Handler {
-	return &Handler{wallets: wallets, wager: wager, reader: reader, pool: pool}
+func NewHandler(wallets *usecases.Wallets, wager *usecases.Wager, reader *usecases.Reader, pool *pgxpool.Pool, queue *queue.Client) *Handler {
+	return &Handler{wallets: wallets, wager: wager, reader: reader, pool: pool, queue: queue}
 }
 
 func (h *Handler) Routes() http.Handler {
@@ -34,6 +36,10 @@ func (h *Handler) Routes() http.Handler {
 	mux.HandleFunc("GET /health/ready", func(w http.ResponseWriter, r *http.Request) {
 		if err := h.pool.Ping(r.Context()); err != nil {
 			writeError(w, 503, "DATABASE_UNAVAILABLE")
+			return
+		}
+		if err := h.queue.Ready(r.Context()); err != nil {
+			writeError(w, 503, "SQS_UNAVAILABLE")
 			return
 		}
 		writeJSON(w, 200, map[string]string{"status": "ready"})

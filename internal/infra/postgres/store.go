@@ -17,7 +17,209 @@ import (
 
 type Store struct{ Pool *pgxpool.Pool }
 
+type OutboxEvent struct {
+	ID          uuid.UUID
+	AggregateID uuid.UUID
+	Payload     []byte
+	Attempts    int
+}
+
 func NewStore(pool *pgxpool.Pool) *Store { return &Store{Pool: pool} }
+
+func (s *Store) StartInbox(ctx context.Context, consumerName, messageID, payloadHash string) (bool, error) {
+	tx, err := s.Pool.Begin(ctx)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback(ctx)
+	var storedHash string
+	var completedAt *time.Time
+	err = tx.QueryRow(ctx, `SELECT payload_hash,completed_at FROM inbox_messages WHERE consumer_name=$1 AND message_id=$2 FOR UPDATE`, consumerName, messageID).Scan(&storedHash, &completedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		_, err = tx.Exec(ctx, `INSERT INTO inbox_messages(consumer_name,message_id,payload_hash) VALUES($1,$2,$3)`, consumerName, messageID, payloadHash)
+		if err != nil {
+			return false, err
+		}
+		return true, tx.Commit(ctx)
+	}
+	if err != nil {
+		return false, err
+	}
+	if storedHash != payloadHash {
+		return false, usecases.ErrConflict
+	}
+	return completedAt == nil, tx.Commit(ctx)
+}
+
+func (s *Store) CompleteInbox(ctx context.Context, consumerName, messageID string) error {
+	_, err := s.Pool.Exec(ctx, `UPDATE inbox_messages SET completed_at=now() WHERE consumer_name=$1 AND message_id=$2`, consumerName, messageID)
+	return err
+}
+
+func (s *Store) ClaimOutbox(ctx context.Context, limit int) ([]OutboxEvent, error) {
+	tx, err := s.Pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback(ctx)
+	rows, err := tx.Query(ctx, `WITH claimed AS (
+		SELECT id FROM outbox_events
+		WHERE published_at IS NULL AND next_attempt_at <= now() AND (claimed_until IS NULL OR claimed_until < now())
+		ORDER BY occurred_at FOR UPDATE SKIP LOCKED LIMIT $1
+	) UPDATE outbox_events o SET claimed_until=now()+interval '30 seconds'
+	FROM claimed WHERE o.id=claimed.id
+	RETURNING o.id,o.aggregate_id,o.payload,o.attempts`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	events := make([]OutboxEvent, 0, limit)
+	for rows.Next() {
+		var event OutboxEvent
+		if err := rows.Scan(&event.ID, &event.AggregateID, &event.Payload, &event.Attempts); err != nil {
+			return nil, err
+		}
+		events = append(events, event)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+	return events, nil
+}
+
+func (s *Store) MarkOutboxPublished(ctx context.Context, id uuid.UUID) error {
+	_, err := s.Pool.Exec(ctx, `UPDATE outbox_events SET published_at=now(),claimed_until=NULL WHERE id=$1 AND published_at IS NULL`, id)
+	return err
+}
+
+func (s *Store) RetryOutbox(ctx context.Context, id uuid.UUID, delay time.Duration) error {
+	_, err := s.Pool.Exec(ctx, `UPDATE outbox_events SET attempts=attempts+1,next_attempt_at=now()+$2::interval,claimed_until=NULL WHERE id=$1 AND published_at IS NULL`, id, delay.String())
+	return err
+}
+
+func (s *Store) ResolvePendingReference(ctx context.Context) (bool, error) {
+	tx, err := s.Pool.Begin(ctx)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback(ctx)
+
+	var op usecases.Operation
+	var transactionID uuid.UUID
+	var attempts int
+	var amount int64
+	var currency string
+	err = tx.QueryRow(ctx, `SELECT id,provider_id,external_transaction_id,idempotency_key,player_id,wallet_id,round_id,game_id,kind,amount_minor,currency,reference_external_transaction_id,attempts
+		FROM wager_transactions WHERE status='PENDING_REFERENCE' AND next_attempt_at <= now()
+		ORDER BY next_attempt_at,id FOR UPDATE SKIP LOCKED LIMIT 1`).Scan(&transactionID, &op.ProviderID, &op.ExternalTransactionID, &op.IdempotencyKey, &op.PlayerID, &op.WalletID, &op.RoundID, &op.GameID, &op.Kind, &amount, &currency, &op.ReferenceExternalTransactionID, &attempts)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, tx.Commit(ctx)
+	}
+	if err != nil {
+		return false, err
+	}
+
+	op.Money, err = model.MoneyFromMinor(amount, currency)
+	if err != nil {
+		return false, err
+	}
+
+	var player uuid.UUID
+	var walletCurrency string
+	var balanceMinor, version int64
+	var createdAt, updatedAt time.Time
+	err = tx.QueryRow(ctx, `SELECT player_id,currency,balance_minor,version,created_at,updated_at FROM wallets WHERE id=$1 FOR UPDATE`, op.WalletID).Scan(&player, &walletCurrency, &balanceMinor, &version, &createdAt, &updatedAt)
+	if err != nil {
+		return false, err
+	}
+	balance, err := model.MoneyFromMinor(balanceMinor, walletCurrency)
+	if err != nil {
+		return false, err
+	}
+	wallet, err := model.RehydrateWallet(op.WalletID, player, balance, version, createdAt, updatedAt)
+	if err != nil {
+		return false, err
+	}
+
+	var reference *usecases.Reference
+	var r usecases.Reference
+	var referenceAmount int64
+	var referenceCurrency string
+	err = tx.QueryRow(ctx, `SELECT id,kind,status,wallet_id,player_id,round_id,amount_minor,currency FROM wager_transactions WHERE provider_id=$1 AND external_transaction_id=$2`, op.ProviderID, op.ReferenceExternalTransactionID).Scan(&r.ID, &r.Kind, &r.Status, &r.WalletID, &r.PlayerID, &r.RoundID, &referenceAmount, &referenceCurrency)
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return false, err
+	}
+	if err == nil {
+		r.Money, err = model.MoneyFromMinor(referenceAmount, referenceCurrency)
+		if err != nil {
+			return false, err
+		}
+		err = tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM wager_transactions WHERE reference_transaction_id=$1 AND status='PROCESSED' AND kind IN ('REFUND','ROLLBACK'))`, r.ID).Scan(&r.AlreadyReversed)
+		if err != nil {
+			return false, err
+		}
+		reference = &r
+	}
+
+	now := time.Now().UTC()
+	decision := usecases.Decide(op, &wallet, reference, now)
+	if decision.Status == model.PendingReference {
+		attempts++
+		if attempts >= 10 {
+			decision = usecases.Decision{Status: model.Rejected, FailureCode: "REFERENCE_NOT_FOUND"}
+		} else {
+			_, err = tx.Exec(ctx, `UPDATE wager_transactions SET attempts=$2,next_attempt_at=$3,updated_at=$4 WHERE id=$1`, transactionID, attempts, now.Add(retryDelay(attempts)), now)
+			if err != nil {
+				return false, err
+			}
+			return true, tx.Commit(ctx)
+		}
+	}
+
+	var referenceID *uuid.UUID
+	if decision.ReferenceID != uuid.Nil {
+		referenceID = &decision.ReferenceID
+	}
+	var failureCode *string
+	if decision.FailureCode != "" {
+		failureCode = &decision.FailureCode
+	}
+	_, err = tx.Exec(ctx, `UPDATE wager_transactions SET status=$2,failure_code=$3,reference_transaction_id=$4,result_balance_minor=$5,next_attempt_at=NULL,updated_at=$6 WHERE id=$1`, transactionID, decision.Status, failureCode, referenceID, wallet.Balance().Minor(), now)
+	if err != nil {
+		return false, err
+	}
+	if decision.Direction != "" {
+		_, err = tx.Exec(ctx, `UPDATE wallets SET balance_minor=$2,version=$3,updated_at=$4 WHERE id=$1`, op.WalletID, wallet.Balance().Minor(), wallet.Version(), now)
+		if err != nil {
+			return false, err
+		}
+		_, err = tx.Exec(ctx, `INSERT INTO wallet_ledger_entries(id,wallet_id,transaction_id,direction,amount_minor,balance_before_minor,balance_after_minor) VALUES($1,$2,$3,$4,$5,$6,$7)`, uuid.New(), op.WalletID, transactionID, decision.Direction, op.Money.Minor(), decision.Before.Minor(), wallet.Balance().Minor())
+		if err != nil {
+			return false, err
+		}
+		if err := addEvent(ctx, tx, op.WalletID, "WalletBalanceChanged", map[string]any{"walletId": op.WalletID, "transactionId": transactionID, "direction": decision.Direction, "money": op.Money, "balanceBefore": decision.Before, "balanceAfter": wallet.Balance(), "walletVersion": wallet.Version()}); err != nil {
+			return false, err
+		}
+	}
+	eventType := "WagerTransactionProcessed"
+	if decision.Status == model.Rejected {
+		eventType = "WagerTransactionRejected"
+	}
+	if err := addEvent(ctx, tx, op.WalletID, eventType, map[string]any{"transactionId": transactionID, "providerId": op.ProviderID, "kind": op.Kind, "status": decision.Status, "failureCode": decision.FailureCode}); err != nil {
+		return false, err
+	}
+	return true, tx.Commit(ctx)
+}
+
+func retryDelay(attempt int) time.Duration {
+	if attempt > 8 {
+		attempt = 8
+	}
+	return time.Second << (attempt - 1)
+}
 
 func (s *Store) CreateWallet(ctx context.Context, wallet model.Wallet) error {
 	tx, err := s.Pool.Begin(ctx)
