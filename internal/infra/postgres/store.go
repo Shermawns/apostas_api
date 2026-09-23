@@ -68,6 +68,153 @@ func (s *Store) GetWallet(ctx context.Context, id uuid.UUID) (model.Wallet, erro
 	return model.RehydrateWallet(id, player, money, version, created, updated)
 }
 
+func (s *Store) ListLedger(ctx context.Context, walletID uuid.UUID, cursor *usecases.LedgerCursor, limit int) (usecases.LedgerPage, error) {
+	var exists bool
+	if err := s.Pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM wallets WHERE id=$1)`, walletID).Scan(&exists); err != nil {
+		return usecases.LedgerPage{}, err
+	}
+	if !exists {
+		return usecases.LedgerPage{}, usecases.ErrNotFound
+	}
+
+	query := `SELECT l.id,l.wallet_id,l.transaction_id,l.direction,l.amount_minor,l.balance_before_minor,l.balance_after_minor,l.created_at,w.currency
+		FROM wallet_ledger_entries l JOIN wallets w ON w.id=l.wallet_id WHERE l.wallet_id=$1 ORDER BY l.created_at,l.id LIMIT $2`
+	args := []any{walletID, limit + 1}
+	if cursor != nil {
+		query = `SELECT l.id,l.wallet_id,l.transaction_id,l.direction,l.amount_minor,l.balance_before_minor,l.balance_after_minor,l.created_at,w.currency
+			FROM wallet_ledger_entries l JOIN wallets w ON w.id=l.wallet_id WHERE l.wallet_id=$1 AND (l.created_at,l.id) > ($2,$3) ORDER BY l.created_at,l.id LIMIT $4`
+		args = []any{walletID, cursor.CreatedAt, cursor.ID, limit + 1}
+	}
+	rows, err := s.Pool.Query(ctx, query, args...)
+	if err != nil {
+		return usecases.LedgerPage{}, err
+	}
+	defer rows.Close()
+
+	entries := make([]usecases.LedgerEntry, 0, limit)
+	for rows.Next() {
+		var entry usecases.LedgerEntry
+		var amount, before, after int64
+		var currency string
+		if err := rows.Scan(&entry.ID, &entry.WalletID, &entry.TransactionID, &entry.Direction, &amount, &before, &after, &entry.CreatedAt, &currency); err != nil {
+			return usecases.LedgerPage{}, err
+		}
+		var moneyErr error
+		entry.Money, moneyErr = model.MoneyFromMinor(amount, currency)
+		if moneyErr == nil {
+			entry.BalanceBefore, moneyErr = model.MoneyFromMinor(before, currency)
+		}
+		if moneyErr == nil {
+			entry.BalanceAfter, moneyErr = model.MoneyFromMinor(after, currency)
+		}
+		if moneyErr != nil {
+			return usecases.LedgerPage{}, moneyErr
+		}
+		entries = append(entries, entry)
+	}
+	if err := rows.Err(); err != nil {
+		return usecases.LedgerPage{}, err
+	}
+	page := usecases.LedgerPage{Entries: entries}
+	if len(entries) > limit {
+		page.Entries = entries[:limit]
+		last := page.Entries[len(page.Entries)-1]
+		page.NextCursor = &usecases.LedgerCursor{CreatedAt: last.CreatedAt, ID: last.ID}
+	}
+	return page, nil
+}
+
+func (s *Store) GetTransaction(ctx context.Context, id uuid.UUID) (usecases.Transaction, error) {
+	row := s.Pool.QueryRow(ctx, transactionQuery+` WHERE id=$1`, id)
+	return scanTransaction(row)
+}
+
+func (s *Store) GetTransactionForProvider(ctx context.Context, id uuid.UUID, providerID string) (usecases.Transaction, error) {
+	row := s.Pool.QueryRow(ctx, transactionQuery+` WHERE id=$1 AND provider_id=$2`, id, providerID)
+	return scanTransaction(row)
+}
+
+func (s *Store) GetTransactionByExternal(ctx context.Context, providerID, externalID string) (usecases.Transaction, error) {
+	row := s.Pool.QueryRow(ctx, transactionQuery+` WHERE provider_id=$1 AND external_transaction_id=$2`, providerID, externalID)
+	return scanTransaction(row)
+}
+
+func (s *Store) ReconcileWallet(ctx context.Context, walletID uuid.UUID) (usecases.Reconciliation, error) {
+	var currency string
+	var stored, calculated int64
+	var entries int64
+	err := s.Pool.QueryRow(ctx, `SELECT w.currency,w.balance_minor,
+		COALESCE(SUM(CASE WHEN l.direction='CREDIT' THEN l.amount_minor ELSE -l.amount_minor END),0)::bigint,
+		COUNT(l.id)
+		FROM wallets w LEFT JOIN wallet_ledger_entries l ON l.wallet_id=w.id
+		WHERE w.id=$1 GROUP BY w.id,w.currency,w.balance_minor`, walletID).Scan(&currency, &stored, &calculated, &entries)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return usecases.Reconciliation{}, usecases.ErrNotFound
+	}
+	if err != nil {
+		return usecases.Reconciliation{}, err
+	}
+	storedMoney, err := model.MoneyFromMinor(stored, currency)
+	if err != nil {
+		return usecases.Reconciliation{}, err
+	}
+	calculatedMoney, err := model.MoneyFromMinor(calculated, currency)
+	if err != nil {
+		return usecases.Reconciliation{}, err
+	}
+	difference, err := storedMoney.Sub(calculatedMoney)
+	if err != nil {
+		return usecases.Reconciliation{}, err
+	}
+	return usecases.Reconciliation{WalletID: walletID, StoredBalance: storedMoney, CalculatedBalance: calculatedMoney, Difference: difference, Consistent: difference.IsZero(), CheckedEntries: entries}, nil
+}
+
+const transactionQuery = `SELECT id,external_transaction_id,provider_id,wallet_id,player_id,round_id,game_id,kind,amount_minor,currency,
+	reference_external_transaction_id,reference_transaction_id,status,failure_code,result_balance_minor,created_at,updated_at FROM wager_transactions`
+
+func scanTransaction(row pgx.Row) (usecases.Transaction, error) {
+	var transaction usecases.Transaction
+	var externalID, providerID, roundID, gameID, referenceExternalID, failureCode *string
+	var referenceID *uuid.UUID
+	var amount int64
+	var currency string
+	var resultMinor *int64
+	err := row.Scan(&transaction.ID, &externalID, &providerID, &transaction.WalletID, &transaction.PlayerID, &roundID, &gameID, &transaction.Kind, &amount, &currency, &referenceExternalID, &referenceID, &transaction.Status, &failureCode, &resultMinor, &transaction.CreatedAt, &transaction.UpdatedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return usecases.Transaction{}, usecases.ErrNotFound
+	}
+	if err != nil {
+		return usecases.Transaction{}, err
+	}
+	var moneyErr error
+	transaction.Money, moneyErr = model.MoneyFromMinor(amount, currency)
+	if moneyErr != nil {
+		return usecases.Transaction{}, moneyErr
+	}
+	if resultMinor != nil {
+		resultBalance, err := model.MoneyFromMinor(*resultMinor, currency)
+		if err != nil {
+			return usecases.Transaction{}, err
+		}
+		transaction.ResultBalance = &resultBalance
+	}
+	transaction.ExternalTransactionID = stringValue(externalID)
+	transaction.ProviderID = stringValue(providerID)
+	transaction.RoundID = stringValue(roundID)
+	transaction.GameID = stringValue(gameID)
+	transaction.ReferenceExternalTransactionID = stringValue(referenceExternalID)
+	transaction.ReferenceTransactionID = referenceID
+	transaction.FailureCode = stringValue(failureCode)
+	return transaction, nil
+}
+
+func stringValue(value *string) string {
+	if value == nil {
+		return ""
+	}
+	return *value
+}
+
 func (s *Store) Execute(ctx context.Context, op usecases.Operation, hash string, decide func(*model.Wallet, *usecases.Reference, time.Time) usecases.Decision) (usecases.Result, error) {
 	tx, err := s.Pool.Begin(ctx)
 	if err != nil {

@@ -3,13 +3,13 @@ package main
 import (
 	"context"
 	"errors"
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/joho/godotenv"
+	"go.uber.org/fx"
 	"log/slog"
 	"net/http"
 	"os"
 	"time"
-	"github.com/jackc/pgx/v5/pgxpool"
-	"github.com/joho/godotenv"
-	"go.uber.org/fx"
 
 	"apostas_api/internal/controller"
 	"apostas_api/internal/infra/config"
@@ -26,8 +26,9 @@ func main() {
 		fx.Module("persistence", fx.Provide(openPool, postgres.NewStore,
 			func(s *postgres.Store) usecases.WalletStore { return s },
 			func(s *postgres.Store) usecases.WagerStore { return s },
+			func(s *postgres.Store) usecases.ReadStore { return s },
 		)),
-		fx.Module("application", fx.Provide(usecases.NewWallets, usecases.NewWager, oidc.NewAuth, controller.NewHandler)),
+		fx.Module("application", fx.Provide(usecases.NewWallets, usecases.NewWager, usecases.NewReader, oidc.NewAuth, controller.NewHandler)),
 		fx.Invoke(startHTTP),
 	).Run()
 }
