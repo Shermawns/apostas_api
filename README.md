@@ -14,6 +14,8 @@ curl http://localhost:8080/health/live
 curl http://localhost:8080/health/ready
 ```
 
+Para executar o mesmo Compose com filas SQS reais definidas no `.env`, use `docker compose -f compose.yaml -f compose.aws.yaml up --build -d`. O arquivo base continua apontando a API para o LocalStack.
+
 No PowerShell, use `Copy-Item .env.example .env` e `Invoke-RestMethod http://localhost:8080/health/ready`. O serviço `migrate` aplica as migrations antes da API. O script `deploy/localstack/init.sh` cria as filas FIFO de entrada, saída e DLQ e configura redrive com cinco recebimentos. A API aguarda SQS e JWKS durante a inicialização, por até 90 segundos. A fila de saída é `wager-events.fifo`.
 
 O arquivo de exemplo contém apenas credenciais locais. Em produção, configure segredos externamente e deixe `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` vazios para usar a cadeia padrão de credenciais da AWS. A política mínima de SQS está em `deploy/aws/iam-policy.json`; seu escopo de ARN deve ser ajustado à conta e região de implantação. O LocalStack aceita as credenciais fictícias do exemplo e não prova enforcement de IAM da AWS.
