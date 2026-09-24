@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -220,17 +221,17 @@ func assertIndependentWalletsAdvance(ctx context.Context, t *testing.T, stores [
 }
 
 func createConcurrencySchema(ctx context.Context, pool *pgxpool.Pool) error {
-	statements := []string{
-		`CREATE TABLE wallets (id uuid PRIMARY KEY, player_id uuid NOT NULL, currency char(3) NOT NULL, balance_minor bigint NOT NULL CHECK (balance_minor >= 0), version bigint NOT NULL CHECK (version >= 1), created_at timestamptz NOT NULL, updated_at timestamptz NOT NULL, UNIQUE (player_id, currency))`,
-		`CREATE TABLE wager_transactions (id uuid PRIMARY KEY, external_transaction_id text, provider_id text, idempotency_key text, payload_hash char(64), wallet_id uuid NOT NULL REFERENCES wallets(id), player_id uuid NOT NULL, round_id text, game_id text, kind text NOT NULL, amount_minor bigint NOT NULL, currency char(3) NOT NULL, reference_external_transaction_id text, reference_transaction_id uuid REFERENCES wager_transactions(id), status text NOT NULL, failure_code text, result_balance_minor bigint, attempts integer NOT NULL DEFAULT 0, next_attempt_at timestamptz, created_at timestamptz NOT NULL DEFAULT now(), updated_at timestamptz NOT NULL DEFAULT now())`,
-		`CREATE UNIQUE INDEX wager_provider_external_unique ON wager_transactions(provider_id, external_transaction_id) WHERE provider_id IS NOT NULL`,
-		`CREATE UNIQUE INDEX wager_provider_key_unique ON wager_transactions(provider_id, idempotency_key) WHERE provider_id IS NOT NULL`,
-		`CREATE UNIQUE INDEX wager_single_reversal_unique ON wager_transactions(reference_transaction_id) WHERE status='PROCESSED' AND kind IN ('REFUND','ROLLBACK')`,
-		`CREATE TABLE wallet_ledger_entries (id uuid PRIMARY KEY, wallet_id uuid NOT NULL REFERENCES wallets(id), transaction_id uuid NOT NULL REFERENCES wager_transactions(id), direction text NOT NULL, amount_minor bigint NOT NULL, balance_before_minor bigint NOT NULL, balance_after_minor bigint NOT NULL, wallet_version bigint NOT NULL, created_at timestamptz NOT NULL, UNIQUE (wallet_id, transaction_id), UNIQUE (wallet_id, wallet_version))`,
-		`CREATE TABLE outbox_events (id uuid PRIMARY KEY, aggregate_id uuid NOT NULL, event_type text NOT NULL, payload jsonb NOT NULL, occurred_at timestamptz NOT NULL DEFAULT now(), attempts integer NOT NULL DEFAULT 0, next_attempt_at timestamptz NOT NULL DEFAULT now(), published_at timestamptz, claimed_until timestamptz)`,
+	migrations := []string{
+		filepath.Join("..", "..", "..", "migrations", "000001_init.up.sql"),
+		filepath.Join("..", "..", "..", "migrations", "000002_wallet_integrity.up.sql"),
+		filepath.Join("..", "..", "..", "migrations", "000003_audit_integrity.up.sql"),
 	}
-	for _, statement := range statements {
-		if _, err := pool.Exec(ctx, statement); err != nil {
+	for _, path := range migrations {
+		sql, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		if _, err := pool.Exec(ctx, string(sql)); err != nil {
 			return err
 		}
 	}
