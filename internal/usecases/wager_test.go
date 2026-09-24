@@ -64,3 +64,25 @@ func TestProcessInboxUsesAtomicStoreOperation(t *testing.T) {
 		t.Fatal("inbox delivery was not sent to the atomic store operation")
 	}
 }
+
+func TestWinReferenceMustBeCompatibleBet(t *testing.T) {
+	money, _ := model.ParseMoney("10.00", "BRL")
+	walletID := uuid.New()
+	playerID := uuid.New()
+	wallet, err := model.NewWallet(walletID, playerID, money, time.Now().UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	op := Operation{ProviderID: "provider", PlayerID: playerID, WalletID: walletID, RoundID: "round", Kind: model.Win, Money: money, ReferenceExternalTransactionID: "bet-1"}
+	if result := Decide(op, &wallet, nil, time.Now().UTC()); result.Status != model.PendingReference {
+		t.Fatalf("missing reference status=%s", result.Status)
+	}
+	ref := &Reference{ID: uuid.New(), Kind: model.Bet, Status: model.Processed, WalletID: walletID, PlayerID: playerID, RoundID: "round", Money: money}
+	if result := Decide(op, &wallet, ref, time.Now().UTC()); result.Status != model.Processed {
+		t.Fatalf("compatible reference status=%s", result.Status)
+	}
+	ref.Kind = model.Win
+	if result := Decide(op, &wallet, ref, time.Now().UTC()); result.Status != model.Rejected || result.FailureCode != "INVALID_REFERENCE" {
+		t.Fatalf("incompatible reference result=%+v", result)
+	}
+}

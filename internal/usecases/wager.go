@@ -109,6 +109,14 @@ func Decide(op Operation, wallet *model.Wallet, ref *Reference, now time.Time) D
 	if op.Kind == model.Loss {
 		return Decision{Status: model.Processed}
 	}
+	if op.Kind == model.Win && op.ReferenceExternalTransactionID != "" {
+		if ref == nil || ref.Status == model.Pending || ref.Status == model.PendingReference {
+			return Decision{Status: model.PendingReference}
+		}
+		if ref.Status != model.Processed || ref.Kind != model.Bet || ref.PlayerID != op.PlayerID || ref.WalletID != op.WalletID || ref.RoundID != op.RoundID || ref.Money.Currency() != op.Money.Currency() {
+			return Decision{Status: model.Rejected, FailureCode: "INVALID_REFERENCE"}
+		}
+	}
 	if op.Kind == model.Refund || op.Kind == model.Rollback {
 		if ref == nil || ref.Status == model.Pending || ref.Status == model.PendingReference {
 			return Decision{Status: model.PendingReference}

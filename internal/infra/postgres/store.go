@@ -182,6 +182,13 @@ func (s *Store) ResolvePendingReference(ctx context.Context) (bool, error) {
 			return true, tx.Commit(ctx)
 		}
 	}
+	state, err := model.RehydrateTransactionState(model.PendingReference)
+	if err != nil {
+		return false, err
+	}
+	if err := state.Transition(decision.Status); err != nil {
+		return false, err
+	}
 
 	var referenceID *uuid.UUID
 	if decision.ReferenceID != uuid.Nil {
@@ -200,8 +207,7 @@ func (s *Store) ResolvePendingReference(ctx context.Context) (bool, error) {
 		if err != nil {
 			return false, err
 		}
-		_, err = tx.Exec(ctx, `INSERT INTO wallet_ledger_entries(id,wallet_id,transaction_id,direction,amount_minor,balance_before_minor,balance_after_minor,wallet_version) VALUES($1,$2,$3,$4,$5,$6,$7,$8)`, uuid.New(), op.WalletID, transactionID, decision.Direction, op.Money.Minor(), decision.Before.Minor(), wallet.Balance().Minor(), wallet.Version())
-		if err != nil {
+		if err := insertLedger(ctx, tx, op.WalletID, transactionID, decision.Direction, op.Money, decision.Before, wallet.Balance(), wallet.Version(), now); err != nil {
 			return false, err
 		}
 		if err := addEvent(ctx, tx, op.WalletID, "WalletBalanceChanged", map[string]any{"walletId": op.WalletID, "transactionId": transactionID, "direction": decision.Direction, "money": op.Money, "balanceBefore": decision.Before, "balanceAfter": wallet.Balance(), "walletVersion": wallet.Version()}); err != nil {
@@ -241,8 +247,7 @@ func (s *Store) CreateWallet(ctx context.Context, wallet model.Wallet) error {
 		if err != nil {
 			return err
 		}
-		_, err = tx.Exec(ctx, `INSERT INTO wallet_ledger_entries(id,wallet_id,transaction_id,direction,amount_minor,balance_before_minor,balance_after_minor,wallet_version) VALUES($1,$2,$3,'CREDIT',$4,0,$4,1)`, uuid.New(), wallet.ID(), transactionID, wallet.Balance().Minor())
-		if err != nil {
+		if err := insertLedger(ctx, tx, wallet.ID(), transactionID, "CREDIT", wallet.Balance(), zero(wallet.Balance().Currency()), wallet.Balance(), 1, wallet.CreatedAt()); err != nil {
 			return err
 		}
 		if err := addEvent(ctx, tx, wallet.ID(), "WagerTransactionProcessed", map[string]any{"transactionId": transactionID, "kind": "OPENING"}); err != nil {
@@ -502,6 +507,10 @@ func (s *Store) executeTx(ctx context.Context, tx pgx.Tx, op usecases.Operation,
 	}
 	now := time.Now().UTC()
 	d := decide(&wallet, ref, now)
+	state := model.NewTransactionState()
+	if err := state.Transition(d.Status); err != nil {
+		return usecases.Result{}, err
+	}
 	transactionID := uuid.New()
 	var referenceID *uuid.UUID
 	if d.ReferenceID != uuid.Nil {
@@ -520,8 +529,7 @@ func (s *Store) executeTx(ctx context.Context, tx pgx.Tx, op usecases.Operation,
 		if err != nil {
 			return usecases.Result{}, err
 		}
-		_, err = tx.Exec(ctx, `INSERT INTO wallet_ledger_entries(id,wallet_id,transaction_id,direction,amount_minor,balance_before_minor,balance_after_minor,wallet_version) VALUES($1,$2,$3,$4,$5,$6,$7,$8)`, uuid.New(), op.WalletID, transactionID, d.Direction, op.Money.Minor(), d.Before.Minor(), wallet.Balance().Minor(), wallet.Version())
-		if err != nil {
+		if err := insertLedger(ctx, tx, op.WalletID, transactionID, d.Direction, op.Money, d.Before, wallet.Balance(), wallet.Version(), now); err != nil {
 			return usecases.Result{}, err
 		}
 		if err := addEvent(ctx, tx, op.WalletID, "WalletBalanceChanged", map[string]any{"walletId": op.WalletID, "transactionId": transactionID, "direction": d.Direction, "money": op.Money, "balanceBefore": d.Before, "balanceAfter": wallet.Balance(), "walletVersion": wallet.Version()}); err != nil {
@@ -548,6 +556,15 @@ func addEvent(ctx context.Context, tx pgx.Tx, aggregate uuid.UUID, eventType str
 		return err
 	}
 	_, err = tx.Exec(ctx, `INSERT INTO outbox_events(id,aggregate_id,event_type,payload) VALUES($1,$2,$3,$4)`, id, aggregate, eventType, payload)
+	return err
+}
+
+func insertLedger(ctx context.Context, tx pgx.Tx, walletID, transactionID uuid.UUID, direction string, money, before, after model.Money, version int64, createdAt time.Time) error {
+	entry, err := model.NewWalletLedgerEntry(uuid.New(), walletID, transactionID, model.LedgerDirection(direction), money, before, after, createdAt)
+	if err != nil {
+		return err
+	}
+	_, err = tx.Exec(ctx, `INSERT INTO wallet_ledger_entries(id,wallet_id,transaction_id,direction,amount_minor,balance_before_minor,balance_after_minor,wallet_version,created_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)`, entry.ID(), entry.WalletID(), entry.TransactionID(), string(entry.Direction()), entry.Money().Minor(), entry.BalanceBefore().Minor(), entry.BalanceAfter().Minor(), version, entry.CreatedAt())
 	return err
 }
 
