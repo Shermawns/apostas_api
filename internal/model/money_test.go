@@ -56,6 +56,19 @@ func TestMoney(t *testing.T) {
 	if _, err := min.Negate(); !errors.Is(err, ErrOverflow) {
 		t.Fatalf("negate err=%v", err)
 	}
+	if difference, err := min.Sub(min); err != nil || !difference.IsZero() {
+		t.Fatalf("minimum minus itself=%v err=%v", difference, err)
+	}
+	if _, err := min.Sub(b); !errors.Is(err, ErrOverflow) {
+		t.Fatalf("subtraction overflow err=%v", err)
+	}
+	if _, err := min.Sub(usd); !errors.Is(err, ErrCurrencyMismatch) {
+		t.Fatalf("subtraction currency err=%v", err)
+	}
+	var strict Money
+	if err := json.Unmarshal([]byte(`{"amount":"1.00","currency":"BRL","ignored":1}`), &strict); err == nil {
+		t.Fatal("money accepted an unknown JSON field")
+	}
 }
 
 func TestWalletInvariants(t *testing.T) {

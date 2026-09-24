@@ -8,6 +8,7 @@ var ErrTerminalTransaction = errors.New("terminal transaction")
 type Kind string
 
 const (
+	Opening  Kind = "OPENING"
 	Bet      Kind = "BET"
 	Win      Kind = "WIN"
 	Loss     Kind = "LOSS"

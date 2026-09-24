@@ -1,9 +1,11 @@
 package model
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"regexp"
 	"strconv"
@@ -90,11 +92,13 @@ func (m Money) Negate() (Money, error) {
 }
 
 func (m Money) Sub(n Money) (Money, error) {
-	negative, err := n.Negate()
-	if err != nil {
-		return Money{}, err
+	if !m.Valid() || !n.Valid() || m.currency != n.currency {
+		return Money{}, ErrCurrencyMismatch
 	}
-	return m.Add(negative)
+	if (n.minor > 0 && m.minor < math.MinInt64+n.minor) || (n.minor < 0 && m.minor > math.MaxInt64+n.minor) {
+		return Money{}, ErrOverflow
+	}
+	return Money{minor: m.minor - n.minor, currency: m.currency}, nil
 }
 
 func (m Money) Compare(n Money) (int, error) {
@@ -139,8 +143,13 @@ func (m *Money) UnmarshalJSON(data []byte) error {
 		Amount   string `json:"amount"`
 		Currency string `json:"currency"`
 	}
-	if err := json.Unmarshal(data, &wire); err != nil {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&wire); err != nil {
 		return err
+	}
+	if err := decoder.Decode(new(any)); !errors.Is(err, io.EOF) {
+		return ErrInvalidMoney
 	}
 	parsed, err := ParseMoney(wire.Amount, wire.Currency)
 	if err != nil {
