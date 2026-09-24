@@ -85,9 +85,28 @@ func TestOutboxPublisherRepublishesStableEventAfterInterruptionBeforeMark(t *tes
 	}
 }
 
+func TestInputConsumerPersistsFailedTransactionAfterRetriesExhausted(t *testing.T) {
+	message := wagerRequestMessage(t)
+	message.ReceiveCount = 5
+	processor := &failureProcessor{transactionID: uuid.New()}
+	ctx, cancel := context.WithCancel(context.Background())
+	input := &fakeInputQueue{messages: []queue.Message{message}, onDelete: cancel}
+	consumer := &InputConsumer{queue: input, wager: processor}
+
+	consumer.Run(ctx)
+
+	if processor.failCalls != 1 || processor.failureCode != "PROCESSING_RETRIES_EXHAUSTED" {
+		t.Fatalf("failure persistence calls=%d code=%q", processor.failCalls, processor.failureCode)
+	}
+	if input.deleteCalls != 1 {
+		t.Fatalf("DeleteMessage calls=%d, want 1 after persisted failure", input.deleteCalls)
+	}
+}
+
 type fakeInputQueue struct {
 	messages    []queue.Message
 	deleteCalls int
+	onDelete    func()
 }
 
 func (q *fakeInputQueue) Receive(context.Context) ([]queue.Message, error) { return q.messages, nil }
@@ -97,6 +116,9 @@ func (q *fakeInputQueue) ChangeVisibility(context.Context, string, time.Duration
 }
 func (q *fakeInputQueue) Delete(context.Context, string) error {
 	q.deleteCalls++
+	if q.onDelete != nil {
+		q.onDelete()
+	}
 	return nil
 }
 
@@ -117,6 +139,22 @@ func (p *replayProcessor) ProcessInbox(context.Context, usecases.InboxMessage, u
 
 func (p *replayProcessor) Fail(context.Context, usecases.Operation, string) (usecases.Result, error) {
 	return usecases.Result{}, errors.New("unexpected failure persistence")
+}
+
+type failureProcessor struct {
+	transactionID uuid.UUID
+	failCalls     int
+	failureCode   string
+}
+
+func (p *failureProcessor) ProcessInbox(context.Context, usecases.InboxMessage, usecases.Operation) (usecases.Result, error) {
+	return usecases.Result{}, errors.New("temporary database failure")
+}
+
+func (p *failureProcessor) Fail(_ context.Context, _ usecases.Operation, code string) (usecases.Result, error) {
+	p.failCalls++
+	p.failureCode = code
+	return usecases.Result{TransactionID: p.transactionID, Status: model.Failed, FailureCode: code}, nil
 }
 
 type fakeOutboxQueue struct{ eventIDs []string }
