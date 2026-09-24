@@ -1,0 +1,25 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ConsumeWagers",
+      "Effect": "Allow",
+      "Action": [
+        "sqs:GetQueueAttributes",
+        "sqs:ReceiveMessage",
+        "sqs:ChangeMessageVisibility",
+        "sqs:DeleteMessage"
+      ],
+      "Resource": "arn:aws:sqs:*:*:wager-transactions.fifo"
+    },
+    {
+      "Sid": "PublishEventsAndFailures",
+      "Effect": "Allow",
+      "Action": ["sqs:GetQueueAttributes", "sqs:SendMessage"],
+      "Resource": [
+        "arn:aws:sqs:*:*:wager-events.fifo",
+        "arn:aws:sqs:*:*:wager-transactions-dlq.fifo"
+      ]
+    }
+  ]
+}
