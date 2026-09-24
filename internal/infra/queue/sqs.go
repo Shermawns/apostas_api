@@ -4,18 +4,21 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strconv"
 	"time"
 
 	"apostas_api/internal/infra/config"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/sqs"
+	"github.com/aws/aws-sdk-go-v2/service/sqs/types"
 )
 
 type Message struct {
 	ID            string
 	ReceiptHandle string
 	Body          string
+	ReceiveCount  int
 }
 
 type Client struct {
@@ -55,6 +58,9 @@ func (c *Client) Receive(ctx context.Context) ([]Message, error) {
 		MaxNumberOfMessages: 10,
 		WaitTimeSeconds:     10,
 		VisibilityTimeout:   30,
+		MessageSystemAttributeNames: []types.MessageSystemAttributeName{
+			types.MessageSystemAttributeNameApproximateReceiveCount,
+		},
 	})
 	if err != nil {
 		return nil, err
@@ -64,9 +70,22 @@ func (c *Client) Receive(ctx context.Context) ([]Message, error) {
 		if message.MessageId == nil || message.ReceiptHandle == nil || message.Body == nil {
 			continue
 		}
-		messages = append(messages, Message{ID: *message.MessageId, ReceiptHandle: *message.ReceiptHandle, Body: *message.Body})
+		receiveCount, _ := strconv.Atoi(message.Attributes[string(types.MessageSystemAttributeNameApproximateReceiveCount)])
+		messages = append(messages, Message{ID: *message.MessageId, ReceiptHandle: *message.ReceiptHandle, Body: *message.Body, ReceiveCount: receiveCount})
 	}
 	return messages, nil
+}
+
+func (c *Client) ChangeVisibility(ctx context.Context, receiptHandle string, delay time.Duration) error {
+	seconds := int32(delay / time.Second)
+	if seconds < 0 {
+		seconds = 0
+	}
+	if seconds > 43200 {
+		seconds = 43200
+	}
+	_, err := c.client.ChangeMessageVisibility(ctx, &sqs.ChangeMessageVisibilityInput{QueueUrl: &c.inputURL, ReceiptHandle: &receiptHandle, VisibilityTimeout: seconds})
+	return err
 }
 
 func (c *Client) Delete(ctx context.Context, receiptHandle string) error {

@@ -22,6 +22,35 @@ type OutboxEvent struct {
 	AggregateID uuid.UUID
 	Payload     []byte
 	Attempts    int
+	OccurredAt  time.Time
+}
+
+type eventEnvelope struct {
+	EventID       uuid.UUID `json:"eventId"`
+	EventType     string    `json:"eventType"`
+	AggregateID   uuid.UUID `json:"aggregateId"`
+	CorrelationID uuid.UUID `json:"correlationId"`
+	OccurredAt    time.Time `json:"occurredAt"`
+	Version       int       `json:"version"`
+	Data          any       `json:"data"`
+}
+
+type walletBalanceChangedData struct {
+	WalletID      uuid.UUID   `json:"walletId"`
+	TransactionID uuid.UUID   `json:"transactionId"`
+	Direction     string      `json:"direction"`
+	Money         model.Money `json:"money"`
+	BalanceBefore model.Money `json:"balanceBefore"`
+	BalanceAfter  model.Money `json:"balanceAfter"`
+	WalletVersion int64       `json:"walletVersion"`
+}
+
+type wagerTransactionEventData struct {
+	TransactionID uuid.UUID    `json:"transactionId"`
+	ProviderID    string       `json:"providerId,omitempty"`
+	Kind          model.Kind   `json:"kind"`
+	Status        model.Status `json:"status"`
+	FailureCode   string       `json:"failureCode,omitempty"`
 }
 
 func NewStore(pool *pgxpool.Pool) *Store { return &Store{Pool: pool} }
@@ -72,7 +101,7 @@ func (s *Store) ClaimOutbox(ctx context.Context, limit int) ([]OutboxEvent, erro
 		ORDER BY occurred_at FOR UPDATE SKIP LOCKED LIMIT $1
 	) UPDATE outbox_events o SET claimed_until=now()+interval '30 seconds'
 	FROM claimed WHERE o.id=claimed.id
-	RETURNING o.id,o.aggregate_id,o.payload,o.attempts`, limit)
+	RETURNING o.id,o.aggregate_id,o.payload,o.attempts,o.occurred_at`, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -80,7 +109,7 @@ func (s *Store) ClaimOutbox(ctx context.Context, limit int) ([]OutboxEvent, erro
 	events := make([]OutboxEvent, 0, limit)
 	for rows.Next() {
 		var event OutboxEvent
-		if err := rows.Scan(&event.ID, &event.AggregateID, &event.Payload, &event.Attempts); err != nil {
+		if err := rows.Scan(&event.ID, &event.AggregateID, &event.Payload, &event.Attempts, &event.OccurredAt); err != nil {
 			return nil, err
 		}
 		events = append(events, event)
@@ -210,7 +239,7 @@ func (s *Store) ResolvePendingReference(ctx context.Context) (bool, error) {
 		if err := insertLedger(ctx, tx, op.WalletID, transactionID, decision.Direction, op.Money, decision.Before, wallet.Balance(), wallet.Version(), now); err != nil {
 			return false, err
 		}
-		if err := addEvent(ctx, tx, op.WalletID, "WalletBalanceChanged", map[string]any{"walletId": op.WalletID, "transactionId": transactionID, "direction": decision.Direction, "money": op.Money, "balanceBefore": decision.Before, "balanceAfter": wallet.Balance(), "walletVersion": wallet.Version()}); err != nil {
+		if err := addEvent(ctx, tx, op.WalletID, transactionID, "WalletBalanceChanged", walletBalanceChangedData{WalletID: op.WalletID, TransactionID: transactionID, Direction: decision.Direction, Money: op.Money, BalanceBefore: decision.Before, BalanceAfter: wallet.Balance(), WalletVersion: wallet.Version()}); err != nil {
 			return false, err
 		}
 	}
@@ -218,7 +247,7 @@ func (s *Store) ResolvePendingReference(ctx context.Context) (bool, error) {
 	if decision.Status == model.Rejected {
 		eventType = "WagerTransactionRejected"
 	}
-	if err := addEvent(ctx, tx, op.WalletID, eventType, map[string]any{"transactionId": transactionID, "providerId": op.ProviderID, "kind": op.Kind, "status": decision.Status, "failureCode": decision.FailureCode}); err != nil {
+	if err := addEvent(ctx, tx, op.WalletID, transactionID, eventType, wagerTransactionEventData{TransactionID: transactionID, ProviderID: op.ProviderID, Kind: op.Kind, Status: decision.Status, FailureCode: decision.FailureCode}); err != nil {
 		return false, err
 	}
 	return true, tx.Commit(ctx)
@@ -250,10 +279,10 @@ func (s *Store) CreateWallet(ctx context.Context, wallet model.Wallet) error {
 		if err := insertLedger(ctx, tx, wallet.ID(), transactionID, "CREDIT", wallet.Balance(), zero(wallet.Balance().Currency()), wallet.Balance(), 1, wallet.CreatedAt()); err != nil {
 			return err
 		}
-		if err := addEvent(ctx, tx, wallet.ID(), "WagerTransactionProcessed", map[string]any{"transactionId": transactionID, "kind": "OPENING"}); err != nil {
+		if err := addEvent(ctx, tx, wallet.ID(), transactionID, "WagerTransactionProcessed", wagerTransactionEventData{TransactionID: transactionID, Kind: "OPENING", Status: model.Processed}); err != nil {
 			return err
 		}
-		if err := addEvent(ctx, tx, wallet.ID(), "WalletBalanceChanged", map[string]any{"walletId": wallet.ID(), "transactionId": transactionID, "direction": "CREDIT", "money": wallet.Balance(), "balanceBefore": zero(wallet.Balance().Currency()), "balanceAfter": wallet.Balance(), "walletVersion": 1}); err != nil {
+		if err := addEvent(ctx, tx, wallet.ID(), transactionID, "WalletBalanceChanged", walletBalanceChangedData{WalletID: wallet.ID(), TransactionID: transactionID, Direction: "CREDIT", Money: wallet.Balance(), BalanceBefore: zero(wallet.Balance().Currency()), BalanceAfter: wallet.Balance(), WalletVersion: 1}); err != nil {
 			return err
 		}
 	}
@@ -532,7 +561,7 @@ func (s *Store) executeTx(ctx context.Context, tx pgx.Tx, op usecases.Operation,
 		if err := insertLedger(ctx, tx, op.WalletID, transactionID, d.Direction, op.Money, d.Before, wallet.Balance(), wallet.Version(), now); err != nil {
 			return usecases.Result{}, err
 		}
-		if err := addEvent(ctx, tx, op.WalletID, "WalletBalanceChanged", map[string]any{"walletId": op.WalletID, "transactionId": transactionID, "direction": d.Direction, "money": op.Money, "balanceBefore": d.Before, "balanceAfter": wallet.Balance(), "walletVersion": wallet.Version()}); err != nil {
+		if err := addEvent(ctx, tx, op.WalletID, transactionID, "WalletBalanceChanged", walletBalanceChangedData{WalletID: op.WalletID, TransactionID: transactionID, Direction: d.Direction, Money: op.Money, BalanceBefore: d.Before, BalanceAfter: wallet.Balance(), WalletVersion: wallet.Version()}); err != nil {
 			return usecases.Result{}, err
 		}
 	}
@@ -543,15 +572,15 @@ func (s *Store) executeTx(ctx context.Context, tx pgx.Tx, op usecases.Operation,
 	if d.Status == model.PendingReference {
 		event = "WagerTransactionPendingReference"
 	}
-	if err := addEvent(ctx, tx, op.WalletID, event, map[string]any{"transactionId": transactionID, "providerId": op.ProviderID, "kind": op.Kind, "status": d.Status, "failureCode": d.FailureCode}); err != nil {
+	if err := addEvent(ctx, tx, op.WalletID, transactionID, event, wagerTransactionEventData{TransactionID: transactionID, ProviderID: op.ProviderID, Kind: op.Kind, Status: d.Status, FailureCode: d.FailureCode}); err != nil {
 		return usecases.Result{}, err
 	}
 	return usecases.Result{TransactionID: transactionID, Status: d.Status, Balance: wallet.Balance(), FailureCode: d.FailureCode}, nil
 }
 
-func addEvent(ctx context.Context, tx pgx.Tx, aggregate uuid.UUID, eventType string, data any) error {
+func addEvent(ctx context.Context, tx pgx.Tx, aggregate, correlation uuid.UUID, eventType string, data any) error {
 	id := uuid.New()
-	payload, err := json.Marshal(map[string]any{"eventId": id, "eventType": eventType, "aggregateId": aggregate, "occurredAt": time.Now().UTC().Format(time.RFC3339Nano), "version": 1, "data": data})
+	payload, err := json.Marshal(eventEnvelope{EventID: id, EventType: eventType, AggregateID: aggregate, CorrelationID: correlation, OccurredAt: time.Now().UTC(), Version: 1, Data: data})
 	if err != nil {
 		return err
 	}

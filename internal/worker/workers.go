@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"apostas_api/internal/infra/metrics"
 	"apostas_api/internal/infra/postgres"
 	"apostas_api/internal/infra/queue"
 	"apostas_api/internal/usecases"
@@ -43,9 +44,28 @@ func (w *InputConsumer) Run(ctx context.Context) {
 			continue
 		}
 		for _, message := range messages {
+			started := time.Now()
 			if err := w.handle(ctx, message); err != nil {
 				slog.Error("SQS message processing failed", "worker", w.Name(), "messageId", message.ID, "error", err)
+				metrics.Inc("apostas_sqs_retries_total")
+				if message.ReceiveCount >= 5 {
+					metrics.Inc("apostas_sqs_dlq_total")
+				}
+				if ctx.Err() == nil {
+					delay := queue.RetryDelay(message.ReceiveCount)
+					if retryErr := w.queue.ChangeVisibility(ctx, message.ReceiptHandle, delay); retryErr != nil {
+						slog.Error("SQS retry scheduling failed", "worker", w.Name(), "messageId", message.ID, "error", retryErr)
+					}
+				}
 				continue
+			}
+			metrics.Inc("apostas_sqs_messages_total{status=\"processed\"}")
+			metrics.Add("apostas_sqs_processing_latency_milliseconds_total", uint64(time.Since(started).Milliseconds()))
+			if ctx.Err() != nil {
+				releaseCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+				_ = w.queue.ChangeVisibility(releaseCtx, message.ReceiptHandle, 0)
+				cancel()
+				return
 			}
 			if err := w.queue.Delete(ctx, message.ReceiptHandle); err != nil && ctx.Err() == nil {
 				slog.Error("SQS message deletion failed", "worker", w.Name(), "messageId", message.ID, "error", err)
@@ -145,6 +165,7 @@ func (w *OutboxPublisher) publish(ctx context.Context) error {
 	}
 	for _, event := range events {
 		if err := w.queue.Publish(ctx, event.ID.String(), event.AggregateID.String(), string(event.Payload)); err != nil {
+			metrics.Inc("apostas_outbox_retries_total")
 			if retryErr := w.store.RetryOutbox(ctx, event.ID, queue.RetryDelay(event.Attempts+1)); retryErr != nil {
 				return retryErr
 			}
@@ -153,6 +174,8 @@ func (w *OutboxPublisher) publish(ctx context.Context) error {
 		if err := w.store.MarkOutboxPublished(ctx, event.ID); err != nil {
 			return err
 		}
+		metrics.Inc("apostas_outbox_published_total")
+		metrics.Add("apostas_outbox_delay_milliseconds_total", uint64(time.Since(event.OccurredAt).Milliseconds()))
 	}
 	return nil
 }

@@ -130,6 +130,58 @@ func TestConcurrentWagersAcrossIndependentProcesses(t *testing.T) {
 		}
 	}
 	assertIndependentWalletsAdvance(ctx, t, stores, wagers, money, stake)
+	assertFiftyDuplicateRequests(ctx, t, stores, wagers)
+}
+
+func assertFiftyDuplicateRequests(ctx context.Context, t *testing.T, stores []*postgres.Store, wagers []*usecases.Wager) {
+	t.Helper()
+	initial, _ := model.ParseMoney("100.00", "BRL")
+	stake, _ := model.ParseMoney("25.00", "BRL")
+	wallet, err := model.NewWallet(uuid.New(), uuid.New(), initial, time.Now().UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := stores[0].CreateWallet(ctx, wallet); err != nil {
+		t.Fatal(err)
+	}
+	op := operation(wallet, "fifty-replay", "fifty-key", stake)
+	start := make(chan struct{})
+	errs := make(chan error, 50)
+	var group sync.WaitGroup
+	for i := 0; i < 50; i++ {
+		group.Add(1)
+		go func(i int) {
+			defer group.Done()
+			<-start
+			_, err := wagers[i%len(wagers)].Process(ctx, op)
+			if err != nil {
+				errs <- err
+			}
+		}(i)
+	}
+	close(start)
+	group.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatal(err)
+	}
+	stored, err := stores[0].GetWallet(ctx, wallet.ID())
+	if err != nil || stored.Balance().Minor() != 7500 {
+		t.Fatalf("wallet=%+v err=%v", stored, err)
+	}
+	page, err := stores[0].ListLedger(ctx, wallet.ID(), nil, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	debits := 0
+	for _, entry := range page.Entries {
+		if entry.Direction == "DEBIT" {
+			debits++
+		}
+	}
+	if debits != 1 {
+		t.Fatalf("debits=%d", debits)
+	}
 }
 
 func assertIndependentWalletsAdvance(ctx context.Context, t *testing.T, stores []*postgres.Store, wagers []*usecases.Wager, initial, stake model.Money) {

@@ -4,17 +4,16 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"log/slog"
 	"net/http"
 	"strconv"
 	"strings"
-	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"apostas_api/internal/infra/metrics"
 	"apostas_api/internal/infra/oidc"
 	"apostas_api/internal/infra/queue"
 	"apostas_api/internal/model"
@@ -22,12 +21,11 @@ import (
 )
 
 type Handler struct {
-	wallets                   *usecases.Wallets
-	wager                     *usecases.Wager
-	reader                    *usecases.Reader
-	pool                      *pgxpool.Pool
-	queue                     *queue.Client
-	reconciliationDivergences atomic.Int64
+	wallets *usecases.Wallets
+	wager   *usecases.Wager
+	reader  *usecases.Reader
+	pool    *pgxpool.Pool
+	queue   *queue.Client
 }
 
 func NewHandler(wallets *usecases.Wallets, wager *usecases.Wager, reader *usecases.Reader, pool *pgxpool.Pool, queue *queue.Client) *Handler {
@@ -126,6 +124,10 @@ func (h *Handler) processWager(w http.ResponseWriter, r *http.Request) {
 	if result.Status == model.Rejected {
 		status = 422
 	}
+	metrics.Inc(`apostas_wager_results_total{status="` + string(result.Status) + `"}`)
+	if result.IdempotentReplay {
+		metrics.Inc("apostas_wager_duplicates_total")
+	}
 	writeJSON(w, status, result)
 }
 
@@ -223,7 +225,7 @@ func (h *Handler) reconcileWallet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !reconciliation.Consistent {
-		h.reconciliationDivergences.Add(1)
+		metrics.Inc("apostas_reconciliation_divergences_total")
 		slog.Error("wallet reconciliation divergence", "walletId", walletID, "storedBalance", reconciliation.StoredBalance.Minor(), "calculatedBalance", reconciliation.CalculatedBalance.Minor())
 	}
 	writeJSON(w, http.StatusOK, reconciliation)
@@ -235,7 +237,9 @@ func (h *Handler) metrics(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4")
-	_, _ = fmt.Fprintf(w, "apostas_reconciliation_divergences_total %d\n", h.reconciliationDivergences.Load())
+	if err := metrics.WritePrometheus(w); err != nil {
+		slog.Error("metrics response failed", "error", err)
+	}
 }
 
 func canReadTransaction(r *http.Request, providerID string) bool {
@@ -313,6 +317,7 @@ func writeUsecaseError(w http.ResponseWriter, err error) {
 	case errors.Is(err, usecases.ErrInvalidInput), errors.Is(err, model.ErrInvalidWallet), errors.Is(err, model.ErrInvalidMoney):
 		writeError(w, 400, "INVALID_INPUT")
 	case errors.Is(err, usecases.ErrConflict):
+		metrics.Inc("apostas_concurrency_conflicts_total")
 		writeError(w, 409, "CONFLICT")
 	case errors.Is(err, usecases.ErrNotFound):
 		writeError(w, 404, "NOT_FOUND")
