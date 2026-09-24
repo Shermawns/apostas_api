@@ -4,9 +4,12 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"log/slog"
 	"net/http"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -19,11 +22,12 @@ import (
 )
 
 type Handler struct {
-	wallets *usecases.Wallets
-	wager   *usecases.Wager
-	reader  *usecases.Reader
-	pool    *pgxpool.Pool
-	queue   *queue.Client
+	wallets                   *usecases.Wallets
+	wager                     *usecases.Wager
+	reader                    *usecases.Reader
+	pool                      *pgxpool.Pool
+	queue                     *queue.Client
+	reconciliationDivergences atomic.Int64
 }
 
 func NewHandler(wallets *usecases.Wallets, wager *usecases.Wager, reader *usecases.Reader, pool *pgxpool.Pool, queue *queue.Client) *Handler {
@@ -33,6 +37,7 @@ func NewHandler(wallets *usecases.Wallets, wager *usecases.Wager, reader *usecas
 func (h *Handler) Routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health/live", func(w http.ResponseWriter, _ *http.Request) { writeJSON(w, 200, map[string]string{"status": "live"}) })
+	mux.HandleFunc("GET /metrics", h.metrics)
 	mux.HandleFunc("GET /health/ready", func(w http.ResponseWriter, r *http.Request) {
 		if err := h.pool.Ping(r.Context()); err != nil {
 			writeError(w, 503, "DATABASE_UNAVAILABLE")
@@ -217,7 +222,20 @@ func (h *Handler) reconcileWallet(w http.ResponseWriter, r *http.Request) {
 		writeUsecaseError(w, err)
 		return
 	}
+	if !reconciliation.Consistent {
+		h.reconciliationDivergences.Add(1)
+		slog.Error("wallet reconciliation divergence", "walletId", walletID, "storedBalance", reconciliation.StoredBalance.Minor(), "calculatedBalance", reconciliation.CalculatedBalance.Minor())
+	}
 	writeJSON(w, http.StatusOK, reconciliation)
+}
+
+func (h *Handler) metrics(w http.ResponseWriter, r *http.Request) {
+	if !internal(r) {
+		writeError(w, http.StatusForbidden, "FORBIDDEN")
+		return
+	}
+	w.Header().Set("Content-Type", "text/plain; version=0.0.4")
+	_, _ = fmt.Fprintf(w, "apostas_reconciliation_divergences_total %d\n", h.reconciliationDivergences.Load())
 }
 
 func canReadTransaction(r *http.Request, providerID string) bool {

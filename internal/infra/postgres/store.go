@@ -555,7 +555,7 @@ func addEvent(ctx context.Context, tx pgx.Tx, aggregate uuid.UUID, eventType str
 	if err != nil {
 		return err
 	}
-	_, err = tx.Exec(ctx, `INSERT INTO outbox_events(id,aggregate_id,event_type,payload) VALUES($1,$2,$3,$4)`, id, aggregate, eventType, payload)
+	_, err = tx.Exec(ctx, `INSERT INTO outbox_events(id,aggregate_id,event_type,payload) VALUES($1,$2,$3,$4)`, id, aggregate, eventType, string(payload))
 	return err
 }
 

@@ -52,6 +52,19 @@ func TestHashExcludesIdempotencyKey(t *testing.T) {
 	}
 }
 
+func TestCanonicalOperationUsesSortedBusinessKeys(t *testing.T) {
+	money, _ := model.ParseMoney("1.5", "BRL")
+	op := Operation{ProviderID: "provider", ExternalTransactionID: "external", PlayerID: uuid.MustParse("00000000-0000-0000-0000-000000000001"), WalletID: uuid.MustParse("00000000-0000-0000-0000-000000000002"), RoundID: "round", GameID: "game", Kind: model.Bet, Money: money}
+	payload, err := canonicalOperation(op)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expected := `{"externalTransactionId":"external","gameId":"game","kind":"BET","money":{"amount":"1.50","currency":"BRL"},"playerId":"00000000-0000-0000-0000-000000000001","providerId":"provider","referenceExternalTransactionId":"","roundId":"round","walletId":"00000000-0000-0000-0000-000000000002"}`
+	if string(payload) != expected {
+		t.Fatalf("canonical payload=%s", payload)
+	}
+}
+
 func TestProcessInboxUsesAtomicStoreOperation(t *testing.T) {
 	money, _ := model.ParseMoney("1.00", "BRL")
 	op := Operation{ProviderID: "provider-a", ExternalTransactionID: "ext-1", IdempotencyKey: "key-1", PlayerID: uuid.New(), WalletID: uuid.New(), RoundID: "round", GameID: "game", Kind: model.Bet, Money: money}

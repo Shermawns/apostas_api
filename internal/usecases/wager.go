@@ -87,8 +87,7 @@ func (u *Wager) process(ctx context.Context, op Operation, inbox *InboxMessage) 
 	if err := model.ValidateOperation(op.Kind, op.Money, op.ReferenceExternalTransactionID); err != nil {
 		return Result{}, ErrInvalidInput
 	}
-	// encoding/json writes struct fields in declaration order, providing a stable cross-transport hash.
-	canonical, err := json.Marshal(op)
+	canonical, err := canonicalOperation(op)
 	if err != nil {
 		return Result{}, err
 	}
@@ -100,6 +99,20 @@ func (u *Wager) process(ctx context.Context, op Operation, inbox *InboxMessage) 
 		return u.store.ExecuteInbox(ctx, *inbox, op, hex.EncodeToString(sum[:]), decision)
 	}
 	return u.store.Execute(ctx, op, hex.EncodeToString(sum[:]), decision)
+}
+
+func canonicalOperation(op Operation) ([]byte, error) {
+	return json.Marshal(map[string]any{
+		"externalTransactionId":          op.ExternalTransactionID,
+		"gameId":                         op.GameID,
+		"kind":                           op.Kind,
+		"money":                          op.Money,
+		"playerId":                       op.PlayerID,
+		"providerId":                     op.ProviderID,
+		"referenceExternalTransactionId": op.ReferenceExternalTransactionID,
+		"roundId":                        op.RoundID,
+		"walletId":                       op.WalletID,
+	})
 }
 
 func Decide(op Operation, wallet *model.Wallet, ref *Reference, now time.Time) Decision {
