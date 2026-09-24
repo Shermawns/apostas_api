@@ -589,6 +589,8 @@ func addWagerEvent(ctx context.Context, tx pgx.Tx, walletID, transactionID uuid.
 		event, err = events.NewWagerTransactionRejected(walletID, transactionID, provider, kind, failure, causation)
 	case model.PendingReference:
 		event, err = events.NewWagerTransactionPendingReference(walletID, transactionID, provider, kind, causation)
+	case model.Failed:
+		return nil
 	default:
 		return model.ErrInvalidTransaction
 	}

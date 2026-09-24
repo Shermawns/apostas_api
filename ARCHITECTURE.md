@@ -192,7 +192,7 @@ stateDiagram-v2
 | `PENDING_REFERENCE` | `FAILED` | Permitido no modelo, não usado pelo resolver atual. |
 | Terminal | qualquer | Proibido. |
 
-No caminho normal, `PENDING` não é confirmado isoladamente: a criação e a decisão acontecem na mesma transação. Ele representa o estado inicial da entidade antes da decisão. `FAILED` existe no domínio e schema, mas nenhum fluxo atual o grava.
+No caminho normal, `PENDING` não é confirmado isoladamente: a criação e a decisão acontecem na mesma transação. Ele representa o estado inicial da entidade antes da decisão. Depois de cinco tentativas transitórias esgotadas no consumer, uma operação externa válida é persistida como `FAILED` com `failureCode=PROCESSING_RETRIES_EXHAUSTED`, sem alteração de saldo ou ledger. Replays retornam esse resultado terminal.
 
 ### Falhas transitórias e permanentes
 
@@ -460,10 +460,9 @@ Logs usam `slog` em JSON e incluem IDs de mensagem, transação, carteira e prov
 2. O consumer não valida que o `MessageGroupId` recebido corresponde a `walletId`, pois esse atributo não é solicitado/mapeado pelo adapter. O contrato depende do produtor; locks e idempotência preservam integridade mesmo com group incorreto, mas o paralelismo e a ordem FIFO esperados podem ser perdidos.
 3. A autorização IAM real não faz parte dos testes automatizados. O E2E usa LocalStack, que não prova enforcement equivalente à AWS. Existe uma policy mínima de implantação e a integração foi desenhada para credenciais reais.
 4. JWKS não possui cache. Cada request autenticado depende de uma chamada ao IdP, e readiness não testa o IdP depois do startup.
-5. `FAILED` é modelado e aceito pelo schema, mas os fluxos atuais não persistem esse estado. Regras de negócio usam `REJECTED`; payload permanente inválido vai à DLQ sem criar uma transação válida.
-6. O retry de referência usa dez tentativas e tempos fixos no código; não há configuração por ambiente nem TTL por timestamp. O failure code final é `REFERENCE_NOT_FOUND`, inclusive quando a referência existe mas continua pendente até o limite.
-7. A outbox tenta publicar indefinidamente com backoff máximo de cinco minutos. Não existe DLQ de eventos nem limite de tentativas da outbox.
-8. Métricas são mantidas em memória por réplica e zeram no restart. Não há tracing distribuído nem exportador Prometheus dedicado; `/metrics` apenas serve o snapshot local.
-9. O limite de 30 segundos para visibility e lease pressupõe operações normais mais curtas. Um processamento mais longo pode ser recebido ou reivindicado novamente; a integridade financeira continua protegida, mas pode haver trabalho duplicado e republicação.
-10. A proteção contra alteração direta depende de constraints e triggers. Superusuários ou contas com permissão para mudar/desabilitar o schema ficam fora do modelo de ameaça.
-11. Não há testes de carga prolongados, caos automatizado, cache/rotação de JWKS sob falha nem benchmark de throughput.
+5. O retry de referência usa dez tentativas e tempos fixos no código; não há configuração por ambiente nem TTL por timestamp. O failure code final é `REFERENCE_NOT_FOUND`, inclusive quando a referência existe mas continua pendente até o limite.
+6. A outbox tenta publicar indefinidamente com backoff máximo de cinco minutos. Não existe DLQ de eventos nem limite de tentativas da outbox.
+7. Métricas são mantidas em memória por réplica e zeram no restart. Não há tracing distribuído nem exportador Prometheus dedicado; `/metrics` apenas serve o snapshot local.
+8. O limite de 30 segundos para visibility e lease pressupõe operações normais mais curtas. Um processamento mais longo pode ser recebido ou reivindicado novamente; a integridade financeira continua protegida, mas pode haver trabalho duplicado e republicação.
+9. A proteção contra alteração direta depende de constraints e triggers. Superusuários ou contas com permissão para mudar/desabilitar o schema ficam fora do modelo de ameaça.
+10. Não há testes de carga prolongados, caos automatizado, cache/rotação de JWKS sob falha nem benchmark de throughput.

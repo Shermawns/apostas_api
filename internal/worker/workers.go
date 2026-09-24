@@ -42,6 +42,7 @@ type inputQueue interface {
 
 type wagerProcessor interface {
 	ProcessInbox(context.Context, usecases.InboxMessage, usecases.Operation) (usecases.Result, error)
+	Fail(context.Context, usecases.Operation, string) (usecases.Result, error)
 }
 
 func (w *InputConsumer) Name() string { return consumerName }
@@ -77,6 +78,16 @@ func (w *InputConsumer) Run(ctx context.Context) {
 			}
 			if handleErr != nil {
 				slog.Error("SQS message processing failed", "worker", w.Name(), "sqsMessageId", message.ID, "receiveCount", message.ReceiveCount, "error", handleErr)
+				if message.ReceiveCount >= 5 && !errors.Is(handleErr, errPermanentMessage) && !errors.Is(handleErr, usecases.ErrInvalidInput) && !errors.Is(handleErr, usecases.ErrConflict) {
+					if result, err := w.recordPermanentFailure(ctx, message); err == nil {
+						slog.Error("SQS processing permanently failed", "sqsMessageId", message.ID, "transactionId", result.TransactionID, "failureCode", result.FailureCode)
+						if err := w.queue.Delete(ctx, message.ReceiptHandle); err != nil {
+							slog.Error("SQS source deletion failed", "sqsMessageId", message.ID, "error", err)
+						}
+						metrics.Inc(`apostas_wager_results_total{status="FAILED"}`)
+						continue
+					}
+				}
 				if errors.Is(handleErr, errPermanentMessage) || errors.Is(handleErr, usecases.ErrInvalidInput) || errors.Is(handleErr, usecases.ErrConflict) || message.ReceiveCount >= 5 {
 					if err := w.queue.DeadLetter(ctx, message); err != nil {
 						slog.Error("SQS dead letter delivery failed", "sqsMessageId", message.ID, "error", err)
@@ -107,6 +118,25 @@ func (w *InputConsumer) Run(ctx context.Context) {
 			}
 		}
 	}
+}
+
+func (w *InputConsumer) recordPermanentFailure(ctx context.Context, message queue.Message) (usecases.Result, error) {
+	var envelope struct {
+		Type string          `json:"type"`
+		Data json.RawMessage `json:"data"`
+	}
+	if err := json.Unmarshal([]byte(message.Body), &envelope); err != nil || envelope.Type != "WagerTransactionRequested" {
+		return usecases.Result{}, errPermanentMessage
+	}
+	var request struct {
+		usecases.Operation
+		IdempotencyKey string `json:"idempotencyKey"`
+	}
+	if err := json.Unmarshal(envelope.Data, &request); err != nil {
+		return usecases.Result{}, err
+	}
+	request.Operation.IdempotencyKey = request.IdempotencyKey
+	return w.wager.Fail(ctx, request.Operation, "PROCESSING_RETRIES_EXHAUSTED")
 }
 
 func (w *InputConsumer) handle(ctx context.Context, message queue.Message) error {

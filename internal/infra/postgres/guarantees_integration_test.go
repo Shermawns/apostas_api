@@ -113,6 +113,19 @@ func TestDatabaseGuarantees(t *testing.T) {
 	if _, err := wager.Process(ctx, conflictingOperation); !errors.Is(err, usecases.ErrConflict) {
 		t.Fatalf("idempotency key payload conflict=%v", err)
 	}
+	failedOperation := operation(wallet, "permanent-infrastructure-failure", "failure-key", stake)
+	failed, err := wager.Fail(ctx, failedOperation, "PERMANENT_INFRASTRUCTURE_FAILURE")
+	if err != nil || failed.Status != model.Failed || failed.FailureCode != "PERMANENT_INFRASTRUCTURE_FAILURE" {
+		t.Fatalf("persist failed transaction=%+v err=%v", failed, err)
+	}
+	failedReplay, err := usecases.NewWager(storeB).Fail(ctx, failedOperation, "PERMANENT_INFRASTRUCTURE_FAILURE")
+	if err != nil || !failedReplay.IdempotentReplay || failedReplay.TransactionID != failed.TransactionID || failedReplay.Status != model.Failed {
+		t.Fatalf("failed replay=%+v err=%v", failedReplay, err)
+	}
+	var failedLedgerEntries int
+	if err := first.QueryRow(ctx, `SELECT count(*) FROM wallet_ledger_entries WHERE transaction_id=$1`, failed.TransactionID).Scan(&failedLedgerEntries); err != nil || failedLedgerEntries != 0 {
+		t.Fatalf("failed transaction ledger entries=%d err=%v", failedLedgerEntries, err)
+	}
 	inbox.PayloadHash = strings.Repeat("b", 64)
 	if _, err := wager.ProcessInbox(ctx, inbox, op); !errors.Is(err, usecases.ErrConflict) {
 		t.Fatalf("hash conflict=%v", err)

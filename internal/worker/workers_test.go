@@ -115,6 +115,10 @@ func (p *replayProcessor) ProcessInbox(context.Context, usecases.InboxMessage, u
 	return usecases.Result{TransactionID: p.transactionID, Status: model.Processed, IdempotentReplay: replay}, nil
 }
 
+func (p *replayProcessor) Fail(context.Context, usecases.Operation, string) (usecases.Result, error) {
+	return usecases.Result{}, errors.New("unexpected failure persistence")
+}
+
 type fakeOutboxQueue struct{ eventIDs []string }
 
 func (q *fakeOutboxQueue) Publish(_ context.Context, eventID, _ string, _ string) error {

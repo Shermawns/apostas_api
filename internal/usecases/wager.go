@@ -80,6 +80,26 @@ func (u *Wager) ProcessInbox(ctx context.Context, inbox InboxMessage, op Operati
 	return u.process(ctx, op, &inbox)
 }
 
+func (u *Wager) Fail(ctx context.Context, op Operation, failureCode string) (Result, error) {
+	if strings.TrimSpace(failureCode) == "" {
+		return Result{}, ErrInvalidInput
+	}
+	if strings.TrimSpace(op.ProviderID) == "" || strings.TrimSpace(op.ExternalTransactionID) == "" || strings.TrimSpace(op.IdempotencyKey) == "" || op.PlayerID == uuid.Nil || op.WalletID == uuid.Nil {
+		return Result{}, ErrInvalidInput
+	}
+	if err := model.ValidateOperation(op.Kind, op.Money, op.ReferenceExternalTransactionID); err != nil {
+		return Result{}, ErrInvalidInput
+	}
+	canonical, err := canonicalOperation(op)
+	if err != nil {
+		return Result{}, err
+	}
+	sum := sha256.Sum256(canonical)
+	return u.store.Execute(ctx, op, hex.EncodeToString(sum[:]), func(wallet *model.Wallet, _ *Reference, _ time.Time) Decision {
+		return Decision{Status: model.Failed, FailureCode: failureCode}
+	})
+}
+
 func (u *Wager) process(ctx context.Context, op Operation, inbox *InboxMessage) (Result, error) {
 	if strings.TrimSpace(op.ProviderID) == "" || strings.TrimSpace(op.ExternalTransactionID) == "" || strings.TrimSpace(op.IdempotencyKey) == "" || strings.TrimSpace(op.RoundID) == "" || strings.TrimSpace(op.GameID) == "" || op.PlayerID == uuid.Nil || op.WalletID == uuid.Nil {
 		return Result{}, ErrInvalidInput
