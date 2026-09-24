@@ -16,6 +16,13 @@ func TestMoney(t *testing.T) {
 			t.Errorf("accepted %q", amount)
 		}
 	}
+	if _, err := ParseMoney("1.00", "ZZZ"); !errors.Is(err, ErrInvalidMoney) {
+		t.Fatalf("invalid currency err=%v", err)
+	}
+	zero, err := Zero("BRL")
+	if err != nil || !zero.IsZero() || zero.Currency() != "BRL" {
+		t.Fatalf("zero=%v err=%v", zero, err)
+	}
 	a, err := ParseMoney("25.5", "BRL")
 	if err != nil {
 		t.Fatal(err)

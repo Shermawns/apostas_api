@@ -7,6 +7,8 @@ import (
 	"math"
 	"regexp"
 	"strconv"
+
+	"golang.org/x/text/currency"
 )
 
 var ErrInvalidMoney = errors.New("invalid money")
@@ -22,7 +24,7 @@ type Money struct {
 }
 
 func ParseMoney(amount, currency string) (Money, error) {
-	if !currencyPattern.MatchString(currency) || !amountPattern.MatchString(amount) {
+	if !validCurrency(currency) || !amountPattern.MatchString(amount) {
 		return Money{}, ErrInvalidMoney
 	}
 	var whole, fraction string
@@ -53,13 +55,15 @@ func ParseMoney(amount, currency string) (Money, error) {
 }
 
 func MoneyFromMinor(minor int64, currency string) (Money, error) {
-	if !currencyPattern.MatchString(currency) {
+	if !validCurrency(currency) {
 		return Money{}, ErrInvalidMoney
 	}
 	return Money{minor: minor, currency: currency}, nil
 }
 
-func (m Money) Valid() bool      { return currencyPattern.MatchString(m.currency) }
+func Zero(currency string) (Money, error) { return MoneyFromMinor(0, currency) }
+
+func (m Money) Valid() bool      { return validCurrency(m.currency) }
 func (m Money) Minor() int64     { return m.minor }
 func (m Money) Currency() string { return m.currency }
 func (m Money) IsPositive() bool { return m.Valid() && m.minor > 0 }
@@ -144,4 +148,12 @@ func (m *Money) UnmarshalJSON(data []byte) error {
 	}
 	*m = parsed
 	return nil
+}
+
+func validCurrency(code string) bool {
+	if !currencyPattern.MatchString(code) {
+		return false
+	}
+	_, err := currency.ParseISO(code)
+	return err == nil
 }
