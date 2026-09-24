@@ -468,7 +468,17 @@ TEST_E2E=1 \
 go test -count=1 ./internal/integration
 ```
 
-Ele valida autenticação, isolamento entre provedores, abertura, replay HTTP/SQS, concorrência entre HTTP e SQS, ledger único, publicação da outbox, DLQ e reconciliação.
+Ele valida token ausente, inválido e expirado emitido pelo Keycloak, isolamento entre provedores, abertura, replay HTTP/SQS, concorrência entre HTTP e SQS, ledger único, publicação da outbox, DLQ e reconciliação.
+
+### Reinício abrupto da API
+
+Com as mesmas dependências reais ativas, este teste inicia uma instância própria da API, confirma uma BET e uma `PENDING_REFERENCE`, encerra o processo sem shutdown e inicia outra instância. Ele comprova o replay idempotente, a pendência persistida e a reconciliação após o reinício:
+
+```bash
+TEST_DATABASE_URL='postgres://apostas:apostas-local-only@localhost:5432/apostas?sslmode=disable' \
+TEST_RESTART=1 \
+go test -count=1 ./internal/integration -run TestRestartPreservesIdempotencyAndPendingReference
+```
 
 ### Todos os testes opt-in
 
@@ -476,6 +486,7 @@ Ele valida autenticação, isolamento entre provedores, abertura, replay HTTP/SQ
 export TEST_DATABASE_URL='postgres://apostas:apostas-local-only@localhost:5432/apostas?sslmode=disable'
 export TEST_FX=1
 export TEST_E2E=1
+export TEST_RESTART=1
 go test -p 1 -count=1 ./cmd/api ./internal/infra/postgres ./internal/integration
 ```
 
@@ -485,6 +496,7 @@ PowerShell:
 $env:TEST_DATABASE_URL = 'postgres://apostas:apostas-local-only@localhost:5432/apostas?sslmode=disable'
 $env:TEST_FX = '1'
 $env:TEST_E2E = '1'
+$env:TEST_RESTART = '1'
 go test -p 1 -count=1 ./cmd/api ./internal/infra/postgres ./internal/integration
 ```
 

@@ -62,6 +62,13 @@ func TestAuthenticatedHTTPAndSQS(t *testing.T) {
 	if status := request(t, client, http.MethodPost, base+"/wallets", "", opening, nil); status != http.StatusUnauthorized {
 		t.Fatalf("unauthenticated wallet status=%d", status)
 	}
+	if status := request(t, client, http.MethodPost, base+"/wallets", "not-a-jwt", opening, nil); status != http.StatusUnauthorized {
+		t.Fatalf("invalid-token wallet status=%d", status)
+	}
+	expiredToken := expiredProviderToken(t, client, idp)
+	if status := request(t, client, http.MethodPost, base+"/wallets", expiredToken, opening, nil); status != http.StatusUnauthorized {
+		t.Fatalf("expired-token wallet status=%d", status)
+	}
 	if status := request(t, client, http.MethodPost, base+"/wallets", providerToken, opening, nil); status != http.StatusForbidden {
 		t.Fatalf("provider wallet status=%d", status)
 	}
@@ -221,6 +228,83 @@ func token(t *testing.T, client *http.Client, base, id, secret string) string {
 		t.Fatal(err)
 	}
 	return value.AccessToken
+}
+
+func expiredProviderToken(t *testing.T, client *http.Client, idp string) string {
+	t.Helper()
+	adminUser := os.Getenv("KEYCLOAK_ADMIN")
+	if adminUser == "" {
+		adminUser = "admin"
+	}
+	adminPassword := os.Getenv("KEYCLOAK_ADMIN_PASSWORD")
+	if adminPassword == "" {
+		adminPassword = "admin-local-only"
+	}
+	form := url.Values{"grant_type": {"password"}, "client_id": {"admin-cli"}, "username": {adminUser}, "password": {adminPassword}}
+	response, err := client.PostForm(idp+"/realms/master/protocol/openid-connect/token", form)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("Keycloak admin token status=%d", response.StatusCode)
+	}
+	var admin struct {
+		AccessToken string `json:"access_token"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&admin); err != nil {
+		t.Fatal(err)
+	}
+	endpoint := idp + "/admin/realms/apostas"
+	req, err := http.NewRequest(http.MethodGet, endpoint, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer "+admin.AccessToken)
+	response, err = client.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("Keycloak realm read status=%d", response.StatusCode)
+	}
+	settings := map[string]any{}
+	if err := json.NewDecoder(response.Body).Decode(&settings); err != nil {
+		t.Fatal(err)
+	}
+	original := settings["accessTokenLifespan"]
+	settings["accessTokenLifespan"] = 1
+	updateRealm(t, client, endpoint, admin.AccessToken, settings)
+	t.Cleanup(func() {
+		settings["accessTokenLifespan"] = original
+		updateRealm(t, client, endpoint, admin.AccessToken, settings)
+	})
+	value := token(t, client, idp, "provider-a", "provider-a-local-only")
+	time.Sleep(2 * time.Second)
+	return value
+}
+
+func updateRealm(t *testing.T, client *http.Client, endpoint, bearer string, settings map[string]any) {
+	t.Helper()
+	body, err := json.Marshal(settings)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req, err := http.NewRequest(http.MethodPut, endpoint, bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer "+bearer)
+	req.Header.Set("Content-Type", "application/json")
+	response, err := client.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusNoContent {
+		t.Fatalf("Keycloak realm update status=%d", response.StatusCode)
+	}
 }
 
 func request(t *testing.T, client *http.Client, method, endpoint, bearer string, body any, output any, headers ...map[string]string) int {
