@@ -498,9 +498,9 @@ Para observar reentrega após interrupção do consumidor:
 4. Aguarde o visibility timeout de 30 segundos e execute `docker compose up -d api`.
 5. Consulte carteira, transação e ledger. A inbox e as constraints impedem um segundo efeito financeiro.
 
-O código não possui um failpoint que permita parar deterministicamente no intervalo exato entre commit PostgreSQL e `DeleteMessage`; portanto, esse teste manual depende do momento da interrupção.
+`go test ./internal/worker` injeta uma interrupção imediatamente depois do commit da inbox e antes de `DeleteMessage`. O teste confirma que a entrega fica sem ack e que um worker substituto a processa como replay persistente, sem novo efeito financeiro.
 
-Para observar recuperação da outbox, crie uma operação e interrompa a API. Eventos não publicados ou claims abandonados voltam a ser elegíveis; o lease do claim expira em 30 segundos. Uma falha após `SendMessage` e antes de `published_at` pode republicar o mesmo `eventId`, então consumidores externos devem deduplicá-lo.
+`go test ./internal/worker` também interrompe o publisher imediatamente depois de `SendMessage` e antes de `MarkOutboxPublished`. A recuperação republica o mesmo `eventId` e só então registra `published_at`; consumidores externos devem deduplicar por esse identificador.
 
 Para testar indisponibilidade do PostgreSQL:
 

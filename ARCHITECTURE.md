@@ -96,6 +96,8 @@ O `Store` concentra operações que precisam de atomicidade:
 
 O ack do SQS não pode participar de uma transação PostgreSQL. A garantia implementada é: inbox, resultado financeiro e conclusão da inbox estão no mesmo commit; `DeleteMessage` ocorre somente depois desse commit. Uma queda entre commit e ack provoca reentrega, que vira replay persistente sem reaplicar dinheiro.
 
+Os testes do worker injetam a interrupção exatamente depois do commit da inbox e antes do `DeleteMessage`, e exatamente depois do `SendMessage` da outbox e antes de `MarkOutboxPublished`. Eles verificam, respectivamente, que a entrega fica sem ack para replay e que a recuperação republica o mesmo `eventId` antes de concluir a outbox.
+
 ## Money
 
 `Money` é um value object imutável com `int64` em unidades mínimas e código ISO 4217. Em BRL, uma unidade mínima é um centavo. O JSON externo sempre usa string decimal e moeda:
@@ -454,15 +456,14 @@ Logs usam `slog` em JSON e incluem IDs de mensagem, transação, carteira e prov
 
 ## Evoluções futuras
 
-1. Não existe failpoint nem teste automatizado que mate o processo exatamente entre `SendMessage` da outbox e `MarkOutboxPublished`, ou entre commit da inbox e `DeleteMessage`. A lógica de recuperação existe e há testes de claim/replay, mas a janela exata só pode ser exercitada manualmente de forma não determinística.
-2. O publisher ordena claims por `occurred_at`, e o SQS agrupa por carteira. Com várias réplicas, dois publishers podem reivindicar lotes adjacentes e enviá-los em ordem diferente da ordem do banco. Portanto, o código não garante ordem estrita global dos eventos de uma carteira entre publishers concorrentes. Consumidores devem usar `walletVersion` nos eventos financeiros quando precisarem ordenar estado.
-3. O consumer não valida que o `MessageGroupId` recebido corresponde a `walletId`, pois esse atributo não é solicitado/mapeado pelo adapter. O contrato depende do produtor; locks e idempotência preservam integridade mesmo com group incorreto, mas o paralelismo e a ordem FIFO esperados podem ser perdidos.
-4. A autorização IAM real não faz parte dos testes automatizados. O E2E usa LocalStack, que não prova enforcement equivalente à AWS. Existe uma policy mínima de implantação e a integração foi desenhada para credenciais reais.
-5. JWKS não possui cache. Cada request autenticado depende de uma chamada ao IdP, e readiness não testa o IdP depois do startup.
-6. `FAILED` é modelado e aceito pelo schema, mas os fluxos atuais não persistem esse estado. Regras de negócio usam `REJECTED`; payload permanente inválido vai à DLQ sem criar uma transação válida.
-7. O retry de referência usa dez tentativas e tempos fixos no código; não há configuração por ambiente nem TTL por timestamp. O failure code final é `REFERENCE_NOT_FOUND`, inclusive quando a referência existe mas continua pendente até o limite.
-8. A outbox tenta publicar indefinidamente com backoff máximo de cinco minutos. Não existe DLQ de eventos nem limite de tentativas da outbox.
-9. Métricas são mantidas em memória por réplica e zeram no restart. Não há tracing distribuído nem exportador Prometheus dedicado; `/metrics` apenas serve o snapshot local.
-10. O limite de 30 segundos para visibility e lease pressupõe operações normais mais curtas. Um processamento mais longo pode ser recebido ou reivindicado novamente; a integridade financeira continua protegida, mas pode haver trabalho duplicado e republicação.
-11. A proteção contra alteração direta depende de constraints e triggers. Superusuários ou contas com permissão para mudar/desabilitar o schema ficam fora do modelo de ameaça.
-12. Não há testes de carga prolongados, caos automatizado, cache/rotação de JWKS sob falha nem benchmark de throughput.
+1. O publisher ordena claims por `occurred_at`, e o SQS agrupa por carteira. Com várias réplicas, dois publishers podem reivindicar lotes adjacentes e enviá-los em ordem diferente da ordem do banco. Portanto, o código não garante ordem estrita global dos eventos de uma carteira entre publishers concorrentes. Consumidores devem usar `walletVersion` nos eventos financeiros quando precisarem ordenar estado.
+2. O consumer não valida que o `MessageGroupId` recebido corresponde a `walletId`, pois esse atributo não é solicitado/mapeado pelo adapter. O contrato depende do produtor; locks e idempotência preservam integridade mesmo com group incorreto, mas o paralelismo e a ordem FIFO esperados podem ser perdidos.
+3. A autorização IAM real não faz parte dos testes automatizados. O E2E usa LocalStack, que não prova enforcement equivalente à AWS. Existe uma policy mínima de implantação e a integração foi desenhada para credenciais reais.
+4. JWKS não possui cache. Cada request autenticado depende de uma chamada ao IdP, e readiness não testa o IdP depois do startup.
+5. `FAILED` é modelado e aceito pelo schema, mas os fluxos atuais não persistem esse estado. Regras de negócio usam `REJECTED`; payload permanente inválido vai à DLQ sem criar uma transação válida.
+6. O retry de referência usa dez tentativas e tempos fixos no código; não há configuração por ambiente nem TTL por timestamp. O failure code final é `REFERENCE_NOT_FOUND`, inclusive quando a referência existe mas continua pendente até o limite.
+7. A outbox tenta publicar indefinidamente com backoff máximo de cinco minutos. Não existe DLQ de eventos nem limite de tentativas da outbox.
+8. Métricas são mantidas em memória por réplica e zeram no restart. Não há tracing distribuído nem exportador Prometheus dedicado; `/metrics` apenas serve o snapshot local.
+9. O limite de 30 segundos para visibility e lease pressupõe operações normais mais curtas. Um processamento mais longo pode ser recebido ou reivindicado novamente; a integridade financeira continua protegida, mas pode haver trabalho duplicado e republicação.
+10. A proteção contra alteração direta depende de constraints e triggers. Superusuários ou contas com permissão para mudar/desabilitar o schema ficam fora do modelo de ameaça.
+11. Não há testes de carga prolongados, caos automatizado, cache/rotação de JWKS sob falha nem benchmark de throughput.

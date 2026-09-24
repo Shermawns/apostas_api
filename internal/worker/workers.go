@@ -14,20 +14,34 @@ import (
 	"apostas_api/internal/infra/postgres"
 	"apostas_api/internal/infra/queue"
 	"apostas_api/internal/usecases"
+	"github.com/google/uuid"
 	"go.uber.org/fx"
 )
 
 const consumerName = "wager-transaction-consumer"
 
 var errPermanentMessage = errors.New("permanent SQS message error")
+var errFaultInjected = errors.New("fault injected after durable work")
 
 type InputConsumer struct {
-	queue *queue.Client
-	wager *usecases.Wager
+	queue       inputQueue
+	wager       wagerProcessor
+	afterCommit func(queue.Message) error
 }
 
 func NewInputConsumer(queue *queue.Client, wager *usecases.Wager) *InputConsumer {
 	return &InputConsumer{queue: queue, wager: wager}
+}
+
+type inputQueue interface {
+	Receive(context.Context) ([]queue.Message, error)
+	DeadLetter(context.Context, queue.Message) error
+	ChangeVisibility(context.Context, string, time.Duration) error
+	Delete(context.Context, string) error
+}
+
+type wagerProcessor interface {
+	ProcessInbox(context.Context, usecases.InboxMessage, usecases.Operation) (usecases.Result, error)
 }
 
 func (w *InputConsumer) Name() string { return consumerName }
@@ -80,6 +94,12 @@ func (w *InputConsumer) Run(ctx context.Context) {
 				}
 				continue
 			}
+			if w.afterCommit != nil {
+				if err := w.afterCommit(message); err != nil {
+					slog.Warn("input consumer stopped by fault injection", "worker", w.Name(), "sqsMessageId", message.ID, "error", err)
+					return
+				}
+			}
 			metrics.Inc("apostas_sqs_messages_total{status=\"processed\"}")
 			metrics.Add("apostas_sqs_processing_latency_milliseconds_total", uint64(time.Since(started).Milliseconds()))
 			if err := w.queue.Delete(ctx, message.ReceiptHandle); err != nil {
@@ -126,8 +146,19 @@ func (w *InputConsumer) handle(ctx context.Context, message queue.Message) error
 }
 
 type OutboxPublisher struct {
-	queue *queue.Client
-	store *postgres.Store
+	queue        outboxQueue
+	store        outboxStore
+	afterPublish func(postgres.OutboxEvent) error
+}
+
+type outboxQueue interface {
+	Publish(context.Context, string, string, string) error
+}
+
+type outboxStore interface {
+	ClaimOutbox(context.Context, int) ([]postgres.OutboxEvent, error)
+	RetryOutbox(context.Context, uuid.UUID, time.Duration) error
+	MarkOutboxPublished(context.Context, uuid.UUID) error
 }
 
 type ReferenceResolver struct {
@@ -192,6 +223,11 @@ func (w *OutboxPublisher) publish(ctx context.Context) error {
 				return retryErr
 			}
 			continue
+		}
+		if w.afterPublish != nil {
+			if err := w.afterPublish(event); err != nil {
+				return err
+			}
 		}
 		if err := w.store.MarkOutboxPublished(ctx, event.ID); err != nil {
 			return err
