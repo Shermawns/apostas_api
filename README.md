@@ -1,4 +1,4 @@
-# Processamento distribuído de apostas
+# Teste Técnico Jungle Gaming - Processamento distribuído de apostas
 
 API em Go para abrir carteiras, registrar apostas e seus resultados, manter um ledger financeiro auditável e processar comandos assíncronos pelo Amazon SQS. O serviço usa PostgreSQL como fonte de verdade, Keycloak para autenticação OIDC e o padrão outbox para publicar eventos somente depois do commit financeiro.
 
