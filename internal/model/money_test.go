@@ -45,6 +45,15 @@ func TestMoney(t *testing.T) {
 		t.Fatalf("json=%s err=%v", encoded, err)
 	}
 	usd, _ := ParseMoney("1.00", "USD")
+	if comparison, err := a.Compare(a); err != nil || comparison != 0 {
+		t.Fatalf("equal comparison=%d err=%v", comparison, err)
+	}
+	if comparison, err := a.Compare(b); err != nil || comparison <= 0 {
+		t.Fatalf("greater comparison=%d err=%v", comparison, err)
+	}
+	if _, err := a.Compare(usd); !errors.Is(err, ErrCurrencyMismatch) {
+		t.Fatalf("comparison currency err=%v", err)
+	}
 	if _, err := a.Add(usd); !errors.Is(err, ErrCurrencyMismatch) {
 		t.Fatalf("currency err=%v", err)
 	}

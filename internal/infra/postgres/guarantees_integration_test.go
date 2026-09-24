@@ -108,6 +108,11 @@ func TestDatabaseGuarantees(t *testing.T) {
 	if err != nil || !replay.IdempotentReplay || replay.TransactionID != original.TransactionID {
 		t.Fatalf("inbox replay=%+v err=%v", replay, err)
 	}
+	conflictingOperation := op
+	conflictingOperation.RoundID = "different-round"
+	if _, err := wager.Process(ctx, conflictingOperation); !errors.Is(err, usecases.ErrConflict) {
+		t.Fatalf("idempotency key payload conflict=%v", err)
+	}
 	inbox.PayloadHash = strings.Repeat("b", 64)
 	if _, err := wager.ProcessInbox(ctx, inbox, op); !errors.Is(err, usecases.ErrConflict) {
 		t.Fatalf("hash conflict=%v", err)
