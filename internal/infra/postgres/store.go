@@ -2,11 +2,11 @@ package postgres
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
 
+	"apostas_api/internal/events"
 	"apostas_api/internal/model"
 	"apostas_api/internal/usecases"
 	"github.com/google/uuid"
@@ -25,33 +25,7 @@ type OutboxEvent struct {
 	OccurredAt  time.Time
 }
 
-type eventEnvelope struct {
-	EventID       uuid.UUID `json:"eventId"`
-	EventType     string    `json:"eventType"`
-	AggregateID   uuid.UUID `json:"aggregateId"`
-	CorrelationID uuid.UUID `json:"correlationId"`
-	OccurredAt    time.Time `json:"occurredAt"`
-	Version       int       `json:"version"`
-	Data          any       `json:"data"`
-}
-
-type walletBalanceChangedData struct {
-	WalletID      uuid.UUID   `json:"walletId"`
-	TransactionID uuid.UUID   `json:"transactionId"`
-	Direction     string      `json:"direction"`
-	Money         model.Money `json:"money"`
-	BalanceBefore model.Money `json:"balanceBefore"`
-	BalanceAfter  model.Money `json:"balanceAfter"`
-	WalletVersion int64       `json:"walletVersion"`
-}
-
-type wagerTransactionEventData struct {
-	TransactionID uuid.UUID    `json:"transactionId"`
-	ProviderID    string       `json:"providerId,omitempty"`
-	Kind          model.Kind   `json:"kind"`
-	Status        model.Status `json:"status"`
-	FailureCode   string       `json:"failureCode,omitempty"`
-}
+type causationKey struct{}
 
 func NewStore(pool *pgxpool.Pool) *Store { return &Store{Pool: pool} }
 
@@ -61,27 +35,27 @@ func (s *Store) ExecuteInbox(ctx context.Context, inbox usecases.InboxMessage, o
 		return usecases.Result{}, err
 	}
 	defer tx.Rollback(ctx)
+	_, err = tx.Exec(ctx, `INSERT INTO inbox_messages(consumer_name,message_id,payload_hash) VALUES($1,$2,$3) ON CONFLICT DO NOTHING`, inbox.ConsumerName, inbox.MessageID, inbox.PayloadHash)
+	if err != nil {
+		return usecases.Result{}, err
+	}
 	var storedHash string
 	var completedAt *time.Time
-	err = tx.QueryRow(ctx, `SELECT payload_hash,completed_at FROM inbox_messages WHERE consumer_name=$1 AND message_id=$2 FOR UPDATE`, inbox.ConsumerName, inbox.MessageID).Scan(&storedHash, &completedAt)
-	if errors.Is(err, pgx.ErrNoRows) {
-		_, err = tx.Exec(ctx, `INSERT INTO inbox_messages(consumer_name,message_id,payload_hash) VALUES($1,$2,$3)`, inbox.ConsumerName, inbox.MessageID, inbox.PayloadHash)
-		if err != nil {
-			return usecases.Result{}, err
-		}
-	} else if err != nil {
+	if err := tx.QueryRow(ctx, `SELECT payload_hash,completed_at FROM inbox_messages WHERE consumer_name=$1 AND message_id=$2 FOR UPDATE`, inbox.ConsumerName, inbox.MessageID).Scan(&storedHash, &completedAt); err != nil {
 		return usecases.Result{}, err
-	} else if storedHash != inbox.PayloadHash {
-		return usecases.Result{}, usecases.ErrConflict
-	} else if completedAt != nil {
-		return usecases.Result{}, tx.Commit(ctx)
 	}
+	if storedHash != inbox.PayloadHash {
+		return usecases.Result{}, usecases.ErrConflict
+	}
+	ctx = context.WithValue(ctx, causationKey{}, inbox.MessageID)
 	result, err := s.executeTx(ctx, tx, op, hash, decide)
 	if err != nil {
 		return usecases.Result{}, err
 	}
-	if _, err := tx.Exec(ctx, `UPDATE inbox_messages SET completed_at=now() WHERE consumer_name=$1 AND message_id=$2`, inbox.ConsumerName, inbox.MessageID); err != nil {
-		return usecases.Result{}, err
+	if completedAt == nil {
+		if _, err := tx.Exec(ctx, `UPDATE inbox_messages SET completed_at=now() WHERE consumer_name=$1 AND message_id=$2`, inbox.ConsumerName, inbox.MessageID); err != nil {
+			return usecases.Result{}, err
+		}
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return usecases.Result{}, err
@@ -239,15 +213,11 @@ func (s *Store) ResolvePendingReference(ctx context.Context) (bool, error) {
 		if err := insertLedger(ctx, tx, op.WalletID, transactionID, decision.Direction, op.Money, decision.Before, wallet.Balance(), wallet.Version(), now); err != nil {
 			return false, err
 		}
-		if err := addEvent(ctx, tx, op.WalletID, transactionID, "WalletBalanceChanged", walletBalanceChangedData{WalletID: op.WalletID, TransactionID: transactionID, Direction: decision.Direction, Money: op.Money, BalanceBefore: decision.Before, BalanceAfter: wallet.Balance(), WalletVersion: wallet.Version()}); err != nil {
+		if err := addBalanceEvent(ctx, tx, op.WalletID, transactionID, decision.Direction, op.Money, decision.Before, wallet.Balance(), wallet.Version()); err != nil {
 			return false, err
 		}
 	}
-	eventType := "WagerTransactionProcessed"
-	if decision.Status == model.Rejected {
-		eventType = "WagerTransactionRejected"
-	}
-	if err := addEvent(ctx, tx, op.WalletID, transactionID, eventType, wagerTransactionEventData{TransactionID: transactionID, ProviderID: op.ProviderID, Kind: op.Kind, Status: decision.Status, FailureCode: decision.FailureCode}); err != nil {
+	if err := addWagerEvent(ctx, tx, op.WalletID, transactionID, op.ProviderID, op.Kind, decision.Status, decision.FailureCode); err != nil {
 		return false, err
 	}
 	return true, tx.Commit(ctx)
@@ -272,17 +242,21 @@ func (s *Store) CreateWallet(ctx context.Context, wallet model.Wallet) error {
 	}
 	if wallet.Balance().IsPositive() {
 		transactionID := uuid.New()
-		_, err = tx.Exec(ctx, `INSERT INTO wager_transactions(id,wallet_id,player_id,kind,amount_minor,currency,status,result_balance_minor) VALUES($1,$2,$3,'OPENING',$4,$5,'PROCESSED',$4)`, transactionID, wallet.ID(), wallet.PlayerID(), wallet.Balance().Minor(), wallet.Balance().Currency())
+		opening, err := model.NewOpeningTransaction(transactionID, wallet.ID(), wallet.PlayerID(), wallet.Balance(), wallet.CreatedAt())
+		if err != nil {
+			return err
+		}
+		_, err = tx.Exec(ctx, `INSERT INTO wager_transactions(id,wallet_id,player_id,kind,amount_minor,currency,status,result_balance_minor) VALUES($1,$2,$3,'OPENING',$4,$5,'PROCESSED',$4)`, opening.ID(), wallet.ID(), wallet.PlayerID(), opening.Money().Minor(), opening.Money().Currency())
 		if err != nil {
 			return err
 		}
 		if err := insertLedger(ctx, tx, wallet.ID(), transactionID, "CREDIT", wallet.Balance(), zero(wallet.Balance().Currency()), wallet.Balance(), 1, wallet.CreatedAt()); err != nil {
 			return err
 		}
-		if err := addEvent(ctx, tx, wallet.ID(), transactionID, "WagerTransactionProcessed", wagerTransactionEventData{TransactionID: transactionID, Kind: "OPENING", Status: model.Processed}); err != nil {
+		if err := addWagerEvent(ctx, tx, wallet.ID(), transactionID, "", model.Kind("OPENING"), model.Processed, ""); err != nil {
 			return err
 		}
-		if err := addEvent(ctx, tx, wallet.ID(), transactionID, "WalletBalanceChanged", walletBalanceChangedData{WalletID: wallet.ID(), TransactionID: transactionID, Direction: "CREDIT", Money: wallet.Balance(), BalanceBefore: zero(wallet.Balance().Currency()), BalanceAfter: wallet.Balance(), WalletVersion: 1}); err != nil {
+		if err := addBalanceEvent(ctx, tx, wallet.ID(), transactionID, "CREDIT", wallet.Balance(), zero(wallet.Balance().Currency()), wallet.Balance(), 1); err != nil {
 			return err
 		}
 	}
@@ -409,17 +383,17 @@ func (s *Store) ReconcileWallet(ctx context.Context, walletID uuid.UUID) (usecas
 	return usecases.Reconciliation{WalletID: walletID, StoredBalance: storedMoney, CalculatedBalance: calculatedMoney, Difference: difference, Consistent: difference.IsZero(), CheckedEntries: entries}, nil
 }
 
-const transactionQuery = `SELECT id,external_transaction_id,provider_id,wallet_id,player_id,round_id,game_id,kind,amount_minor,currency,
+const transactionQuery = `SELECT id,external_transaction_id,provider_id,idempotency_key,payload_hash,wallet_id,player_id,round_id,game_id,kind,amount_minor,currency,
 	reference_external_transaction_id,reference_transaction_id,status,failure_code,result_balance_minor,created_at,updated_at FROM wager_transactions`
 
 func scanTransaction(row pgx.Row) (usecases.Transaction, error) {
 	var transaction usecases.Transaction
-	var externalID, providerID, roundID, gameID, referenceExternalID, failureCode *string
+	var externalID, providerID, key, hash, roundID, gameID, referenceExternalID, failureCode *string
 	var referenceID *uuid.UUID
 	var amount int64
 	var currency string
 	var resultMinor *int64
-	err := row.Scan(&transaction.ID, &externalID, &providerID, &transaction.WalletID, &transaction.PlayerID, &roundID, &gameID, &transaction.Kind, &amount, &currency, &referenceExternalID, &referenceID, &transaction.Status, &failureCode, &resultMinor, &transaction.CreatedAt, &transaction.UpdatedAt)
+	err := row.Scan(&transaction.ID, &externalID, &providerID, &key, &hash, &transaction.WalletID, &transaction.PlayerID, &roundID, &gameID, &transaction.Kind, &amount, &currency, &referenceExternalID, &referenceID, &transaction.Status, &failureCode, &resultMinor, &transaction.CreatedAt, &transaction.UpdatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return usecases.Transaction{}, usecases.ErrNotFound
 	}
@@ -445,6 +419,22 @@ func scanTransaction(row pgx.Row) (usecases.Transaction, error) {
 	transaction.ReferenceExternalTransactionID = stringValue(referenceExternalID)
 	transaction.ReferenceTransactionID = referenceID
 	transaction.FailureCode = stringValue(failureCode)
+	identity := model.WagerTransactionData{
+		ID: transaction.ID, ExternalTransactionID: transaction.ExternalTransactionID, ProviderID: transaction.ProviderID,
+		IdempotencyKey: stringValue(key), PayloadHash: stringValue(hash), WalletID: transaction.WalletID,
+		PlayerID: transaction.PlayerID, RoundID: transaction.RoundID, GameID: transaction.GameID,
+		Kind: transaction.Kind, Money: transaction.Money, ReferenceExternalTransactionID: transaction.ReferenceExternalTransactionID,
+		Status: transaction.Status, FailureCode: transaction.FailureCode, CreatedAt: transaction.CreatedAt, UpdatedAt: transaction.UpdatedAt,
+	}
+	if referenceID != nil {
+		identity.ReferenceTransactionID = *referenceID
+	}
+	if transaction.ResultBalance != nil {
+		identity.ResultBalance = *transaction.ResultBalance
+	}
+	if _, err := model.RehydrateWagerTransaction(identity); err != nil {
+		return usecases.Transaction{}, err
+	}
 	return transaction, nil
 }
 
@@ -536,11 +526,19 @@ func (s *Store) executeTx(ctx context.Context, tx pgx.Tx, op usecases.Operation,
 	}
 	now := time.Now().UTC()
 	d := decide(&wallet, ref, now)
-	state := model.NewTransactionState()
-	if err := state.Transition(d.Status); err != nil {
+	transactionID := uuid.New()
+	transaction, err := model.NewWagerTransaction(model.WagerTransactionData{
+		ID: transactionID, ExternalTransactionID: op.ExternalTransactionID, ProviderID: op.ProviderID,
+		IdempotencyKey: op.IdempotencyKey, PayloadHash: hash, WalletID: op.WalletID, PlayerID: op.PlayerID,
+		RoundID: op.RoundID, GameID: op.GameID, Kind: op.Kind, Money: op.Money,
+		ReferenceExternalTransactionID: op.ReferenceExternalTransactionID, CreatedAt: now,
+	})
+	if err != nil {
 		return usecases.Result{}, err
 	}
-	transactionID := uuid.New()
+	if err := transaction.Transition(d.Status, d.FailureCode, wallet.Balance(), d.ReferenceID, now); err != nil {
+		return usecases.Result{}, err
+	}
 	var referenceID *uuid.UUID
 	if d.ReferenceID != uuid.Nil {
 		referenceID = &d.ReferenceID
@@ -561,30 +559,47 @@ func (s *Store) executeTx(ctx context.Context, tx pgx.Tx, op usecases.Operation,
 		if err := insertLedger(ctx, tx, op.WalletID, transactionID, d.Direction, op.Money, d.Before, wallet.Balance(), wallet.Version(), now); err != nil {
 			return usecases.Result{}, err
 		}
-		if err := addEvent(ctx, tx, op.WalletID, transactionID, "WalletBalanceChanged", walletBalanceChangedData{WalletID: op.WalletID, TransactionID: transactionID, Direction: d.Direction, Money: op.Money, BalanceBefore: d.Before, BalanceAfter: wallet.Balance(), WalletVersion: wallet.Version()}); err != nil {
+		if err := addBalanceEvent(ctx, tx, op.WalletID, transactionID, d.Direction, op.Money, d.Before, wallet.Balance(), wallet.Version()); err != nil {
 			return usecases.Result{}, err
 		}
 	}
-	event := "WagerTransactionProcessed"
-	if d.Status == model.Rejected {
-		event = "WagerTransactionRejected"
-	}
-	if d.Status == model.PendingReference {
-		event = "WagerTransactionPendingReference"
-	}
-	if err := addEvent(ctx, tx, op.WalletID, transactionID, event, wagerTransactionEventData{TransactionID: transactionID, ProviderID: op.ProviderID, Kind: op.Kind, Status: d.Status, FailureCode: d.FailureCode}); err != nil {
+	if err := addWagerEvent(ctx, tx, op.WalletID, transactionID, op.ProviderID, op.Kind, d.Status, d.FailureCode); err != nil {
 		return usecases.Result{}, err
 	}
 	return usecases.Result{TransactionID: transactionID, Status: d.Status, Balance: wallet.Balance(), FailureCode: d.FailureCode}, nil
 }
 
-func addEvent(ctx context.Context, tx pgx.Tx, aggregate, correlation uuid.UUID, eventType string, data any) error {
-	id := uuid.New()
-	payload, err := json.Marshal(eventEnvelope{EventID: id, EventType: eventType, AggregateID: aggregate, CorrelationID: correlation, OccurredAt: time.Now().UTC(), Version: 1, Data: data})
+func addBalanceEvent(ctx context.Context, tx pgx.Tx, walletID, transactionID uuid.UUID, direction string, money, before, after model.Money, version int64) error {
+	causation, _ := ctx.Value(causationKey{}).(string)
+	event, err := events.NewWalletBalanceChanged(events.WalletBalanceChanged{WalletID: walletID, TransactionID: transactionID, Direction: direction, Money: money, BalanceBefore: before, BalanceAfter: after, WalletVersion: version}, causation)
 	if err != nil {
 		return err
 	}
-	_, err = tx.Exec(ctx, `INSERT INTO outbox_events(id,aggregate_id,event_type,payload) VALUES($1,$2,$3,$4)`, id, aggregate, eventType, string(payload))
+	return addEvent(ctx, tx, event)
+}
+
+func addWagerEvent(ctx context.Context, tx pgx.Tx, walletID, transactionID uuid.UUID, provider string, kind model.Kind, status model.Status, failure string) error {
+	causation, _ := ctx.Value(causationKey{}).(string)
+	var event events.Event
+	var err error
+	switch status {
+	case model.Processed:
+		event, err = events.NewWagerTransactionProcessed(walletID, transactionID, provider, kind, causation)
+	case model.Rejected:
+		event, err = events.NewWagerTransactionRejected(walletID, transactionID, provider, kind, failure, causation)
+	case model.PendingReference:
+		event, err = events.NewWagerTransactionPendingReference(walletID, transactionID, provider, kind, causation)
+	default:
+		return model.ErrInvalidTransaction
+	}
+	if err != nil {
+		return err
+	}
+	return addEvent(ctx, tx, event)
+}
+
+func addEvent(ctx context.Context, tx pgx.Tx, event events.Event) error {
+	_, err := tx.Exec(ctx, `INSERT INTO outbox_events(id,aggregate_id,event_type,payload) VALUES($1,$2,$3,$4)`, event.ID(), event.AggregateID(), event.Type(), string(event.Payload()))
 	return err
 }
 
