@@ -25,12 +25,13 @@ type Client struct {
 	client    *sqs.Client
 	inputURL  string
 	outputURL string
+	dlqURL    string
 }
 
 func NewClient(cfg config.Config) (*Client, error) {
-	loadOptions := []func(*awsconfig.LoadOptions) error{
-		awsconfig.WithRegion(cfg.AWSRegion),
-		awsconfig.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(cfg.AWSAccessKey, cfg.AWSSecretKey, "")),
+	loadOptions := []func(*awsconfig.LoadOptions) error{awsconfig.WithRegion(cfg.AWSRegion)}
+	if cfg.AWSAccessKey != "" && cfg.AWSSecretKey != "" {
+		loadOptions = append(loadOptions, awsconfig.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(cfg.AWSAccessKey, cfg.AWSSecretKey, "")))
 	}
 	if cfg.AWSEndpoint != "" {
 		loadOptions = append(loadOptions, awsconfig.WithBaseEndpoint(cfg.AWSEndpoint))
@@ -39,11 +40,11 @@ func NewClient(cfg config.Config) (*Client, error) {
 	if err != nil {
 		return nil, fmt.Errorf("load AWS configuration: %w", err)
 	}
-	return &Client{client: sqs.NewFromConfig(awsCfg), inputURL: cfg.InputQueueURL, outputURL: cfg.OutputQueueURL}, nil
+	return &Client{client: sqs.NewFromConfig(awsCfg), inputURL: cfg.InputQueueURL, outputURL: cfg.OutputQueueURL, dlqURL: cfg.DLQURL}, nil
 }
 
 func (c *Client) Ready(ctx context.Context) error {
-	for _, queueURL := range []string{c.inputURL, c.outputURL} {
+	for _, queueURL := range []string{c.inputURL, c.outputURL, c.dlqURL} {
 		_, err := c.client.GetQueueAttributes(ctx, &sqs.GetQueueAttributesInput{QueueUrl: &queueURL})
 		if err != nil {
 			return fmt.Errorf("check SQS queue: %w", err)
@@ -52,10 +53,19 @@ func (c *Client) Ready(ctx context.Context) error {
 	return nil
 }
 
+func (c *Client) DeadLetter(ctx context.Context, message Message) error {
+	groupID := message.ID
+	_, err := c.client.SendMessage(ctx, &sqs.SendMessageInput{
+		QueueUrl: &c.dlqURL, MessageBody: &message.Body,
+		MessageGroupId: &groupID, MessageDeduplicationId: &message.ID,
+	})
+	return err
+}
+
 func (c *Client) Receive(ctx context.Context) ([]Message, error) {
 	response, err := c.client.ReceiveMessage(ctx, &sqs.ReceiveMessageInput{
 		QueueUrl:            &c.inputURL,
-		MaxNumberOfMessages: 10,
+		MaxNumberOfMessages: 1,
 		WaitTimeSeconds:     10,
 		VisibilityTimeout:   30,
 		MessageSystemAttributeNames: []types.MessageSystemAttributeName{

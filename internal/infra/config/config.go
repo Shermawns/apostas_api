@@ -19,6 +19,7 @@ type Config struct {
 	AWSSecretKey    string
 	InputQueueURL   string
 	OutputQueueURL  string
+	DLQURL          string
 }
 
 func Load() (Config, error) {
@@ -27,10 +28,13 @@ func Load() (Config, error) {
 		IssuerURL: os.Getenv("OIDC_ISSUER_URL"), JWKSURL: os.Getenv("OIDC_JWKS_URL"), Audience: os.Getenv("OIDC_AUDIENCE"),
 		AWSRegion: os.Getenv("AWS_REGION"), AWSEndpoint: os.Getenv("AWS_ENDPOINT_URL"),
 		AWSAccessKey: os.Getenv("AWS_ACCESS_KEY_ID"), AWSSecretKey: os.Getenv("AWS_SECRET_ACCESS_KEY"),
-		InputQueueURL: os.Getenv("AWS_SQS_INPUT_QUEUE_URL"), OutputQueueURL: os.Getenv("AWS_SQS_OUTPUT_QUEUE_URL"),
+		InputQueueURL: os.Getenv("AWS_SQS_INPUT_QUEUE_URL"), OutputQueueURL: os.Getenv("AWS_SQS_OUTPUT_QUEUE_URL"), DLQURL: os.Getenv("AWS_SQS_DLQ_URL"),
 	}
-	if c.Addr == "" || c.DatabaseURL == "" || c.IssuerURL == "" || c.JWKSURL == "" || c.Audience == "" || c.AWSRegion == "" || c.InputQueueURL == "" || c.OutputQueueURL == "" {
+	if c.Addr == "" || c.DatabaseURL == "" || c.IssuerURL == "" || c.JWKSURL == "" || c.Audience == "" || c.AWSRegion == "" || c.InputQueueURL == "" || c.OutputQueueURL == "" || c.DLQURL == "" {
 		return Config{}, errors.New("missing required configuration")
+	}
+	if (c.AWSAccessKey == "") != (c.AWSSecretKey == "") {
+		return Config{}, errors.New("AWS credentials must be supplied together")
 	}
 	var err error
 	c.ShutdownTimeout, err = time.ParseDuration(os.Getenv("APP_SHUTDOWN_TIMEOUT"))

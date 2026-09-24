@@ -32,6 +32,31 @@ func NewAuth(cfg config.Config) *Auth {
 	return &Auth{cfg: cfg, client: &http.Client{Timeout: 5 * time.Second}}
 }
 
+func (a *Auth) Ready(ctx context.Context) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, a.cfg.JWKSURL, nil)
+	if err != nil {
+		return err
+	}
+	res, err := a.client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		return errors.New("OIDC JWKS unavailable")
+	}
+	var keys struct {
+		Keys []json.RawMessage `json:"keys"`
+	}
+	if err := json.NewDecoder(res.Body).Decode(&keys); err != nil {
+		return err
+	}
+	if len(keys.Keys) == 0 {
+		return errors.New("OIDC JWKS has no keys")
+	}
+	return nil
+}
+
 func (a *Auth) Middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasPrefix(r.URL.Path, "/health/") {

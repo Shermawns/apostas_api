@@ -4,6 +4,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"io"
 	"log/slog"
 	"net/http"
 	"strconv"
@@ -76,6 +77,7 @@ func (h *Handler) openWallet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 201, walletResponse(wallet))
+	slog.Info("wallet opened", "walletId", wallet.ID(), "playerId", wallet.PlayerID())
 }
 
 func (h *Handler) getWallet(w http.ResponseWriter, r *http.Request) {
@@ -128,6 +130,7 @@ func (h *Handler) processWager(w http.ResponseWriter, r *http.Request) {
 	if result.IdempotentReplay {
 		metrics.Inc("apostas_wager_duplicates_total")
 	}
+	slog.Info("HTTP wager handled", "correlationId", result.TransactionID, "transactionId", result.TransactionID, "walletId", op.WalletID, "providerId", op.ProviderID, "status", result.Status, "idempotentReplay", result.IdempotentReplay)
 	writeJSON(w, status, result)
 }
 
@@ -299,7 +302,10 @@ func decode(r *http.Request, out any) bool {
 	r.Body = http.MaxBytesReader(nil, r.Body, 1<<20)
 	d := json.NewDecoder(r.Body)
 	d.DisallowUnknownFields()
-	return d.Decode(out) == nil
+	if err := d.Decode(out); err != nil {
+		return false
+	}
+	return errors.Is(d.Decode(new(any)), io.EOF)
 }
 func walletResponse(w model.Wallet) any {
 	return map[string]any{"id": w.ID(), "playerId": w.PlayerID(), "balance": w.Balance(), "version": w.Version()}

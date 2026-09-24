@@ -14,6 +14,17 @@
       ]
     },
     {
+      "clientId": "provider-b",
+      "enabled": true,
+      "publicClient": false,
+      "serviceAccountsEnabled": true,
+      "secret": "provider-b-local-only",
+      "directAccessGrantsEnabled": false,
+      "protocolMappers": [
+        {"name":"api-audience","protocol":"openid-connect","protocolMapper":"oidc-audience-mapper","config":{"included.client.audience":"apostas-api","access.token.claim":"true"}}
+      ]
+    },
+    {
       "clientId": "wallet-service",
       "enabled": true,
       "publicClient": false,
